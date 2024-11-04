@@ -1,6 +1,9 @@
 import cv2
 import pytest
-from camera_helper import CameraHelper
+import sys,os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from lib import camera_helper
 
 def is_blurry(image, threshold=100.0):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)

@@ -1,181 +1,154 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QMessageBox
-import test_powerUSB
-import test_powerGigE
-import test_IO
-import test_multicam
-import test_imgQuality
-import test_ROI
-import funct_blurDetection
-import funct_CalibCam
-import funct_EdgeDetection
-import adv_barcodeScan
-import adv_textDetection
-
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, 
+    QStackedWidget
+)
+from PyQt5.QtCore import QDateTime
 
 class CameraTestGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-
         self.initUI()
 
     def initUI(self):
         self.setWindowTitle('GenICam Camera Testing Interface')
-        self.setGeometry(100, 100, 400, 600)
+        self.setGeometry(100, 100, 400, 400)
 
-        # Central widget
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
+        # Central widget and stacked layout
+        self.central_widget = QStackedWidget(self)
+        self.setCentralWidget(self.central_widget)
 
-        # Layout
-        layout = QVBoxLayout(central_widget)
+        # Initialize pages
+        self.init_welcome_screen()
+        self.init_homepage_usb()
+        self.init_homepage_gige()
 
-        # Title label
-        title_label = QLabel("GenICam Camera Test Suite", self)
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        layout.addWidget(title_label)
+        # Set the initial page (Welcome screen)
+        self.central_widget.setCurrentWidget(self.welcome_page)
 
-        # Power Test Buttons
-        layout.addWidget(QLabel("Power Tests", self).setStyleSheet("font-size: 14px;"))
-        usb_button = QPushButton("Test Power (USB)", self)
-        usb_button.clicked.connect(self.test_power_usb)
-        layout.addWidget(usb_button)
+    def init_welcome_screen(self):
+        # Welcome screen layout
+        self.welcome_page = QWidget(self)
+        layout = QVBoxLayout(self.welcome_page)
 
-        gige_button = QPushButton("Test Power (GigE)", self)
-        gige_button.clicked.connect(self.test_power_gige)
-        layout.addWidget(gige_button)
+        # Welcome text
+        welcome_label = QLabel("Welcome to GenICAM Tester", self)
+        welcome_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(welcome_label)
 
-        # Basic Test Buttons
-        layout.addWidget(QLabel("Basic Tests", self).setStyleSheet("font-size: 14px;"))
-        io_button = QPushButton("Test I/O", self)
-        io_button.clicked.connect(self.test_io)
-        layout.addWidget(io_button)
+        # USB and GigE Camera Buttons
+        start_usb_button = QPushButton("Start Test USB Camera", self)
+        start_usb_button.clicked.connect(self.start_usb_test)
+        layout.addWidget(start_usb_button)
 
-        multicam_button = QPushButton("Test Multi-Camera", self)
-        multicam_button.clicked.connect(self.test_multicam)
-        layout.addWidget(multicam_button)
+        start_gige_button = QPushButton("Start Test GigE Camera", self)
+        start_gige_button.clicked.connect(self.start_gige_test)
+        layout.addWidget(start_gige_button)
 
-        image_quality_button = QPushButton("Test Image Quality", self)
-        image_quality_button.clicked.connect(self.test_image_quality)
-        layout.addWidget(image_quality_button)
+        # Version history
+        version_label = QLabel("Version history: 2024 The end of the world", self)
+        version_label.setStyleSheet("font-size: 12px; color: grey;")
+        layout.addWidget(version_label)
 
-        roi_button = QPushButton("Test ROI", self)
-        roi_button.clicked.connect(self.test_roi)
-        layout.addWidget(roi_button)
+        self.central_widget.addWidget(self.welcome_page)
 
-        # Functional Test Buttons
-        layout.addWidget(QLabel("Functional Tests", self).setStyleSheet("font-size: 14px;"))
-        blur_button = QPushButton("Blur Detection", self)
-        blur_button.clicked.connect(self.blur_detection)
-        layout.addWidget(blur_button)
+    def init_homepage_usb(self):
+        # USB Camera Test Homepage layout
+        self.homepage_usb = QWidget(self)
+        layout = QVBoxLayout(self.homepage_usb)
 
-        edge_button = QPushButton("Edge Detection", self)
-        edge_button.clicked.connect(self.edge_detection)
-        layout.addWidget(edge_button)
+        # Camera detection header
+        camera_detection_label = QLabel("Camera Detection (USB Camera)", self)
+        camera_detection_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(camera_detection_label)
 
-        calibration_button = QPushButton("Camera Calibration", self)
-        calibration_button.clicked.connect(self.camera_calibration)
-        layout.addWidget(calibration_button)
+        # Button to start camera detection
+        start_usb_detection_button = QPushButton("Start USB Camera Detection", self)
+        start_usb_detection_button.clicked.connect(self.detect_usb_camera)
+        layout.addWidget(start_usb_detection_button)
 
-        # Advanced Test Buttons
-        layout.addWidget(QLabel("Advanced Tests", self).setStyleSheet("font-size: 14px;"))
-        barcode_button = QPushButton("Barcode Scanning", self)
-        barcode_button.clicked.connect(self.barcode_scan)
-        layout.addWidget(barcode_button)
+        # Area to display device information or error message
+        self.device_info_usb = QLabel("", self)
+        layout.addWidget(self.device_info_usb)
 
-        text_detection_button = QPushButton("Text Detection", self)
-        text_detection_button.clicked.connect(self.text_detection)
-        layout.addWidget(text_detection_button)
+        # Go Back Button
+        go_back_button = QPushButton("Go Back", self)
+        go_back_button.clicked.connect(self.go_back)
+        layout.addWidget(go_back_button)
 
-        # Exit Button
-        exit_button = QPushButton("Exit", self)
-        exit_button.clicked.connect(self.close)
-        layout.addWidget(exit_button)
+        self.central_widget.addWidget(self.homepage_usb)
 
-    def show_message(self, title, message, is_error=False):
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Critical if is_error else QMessageBox.Information)
-        msg.setText(message)
-        msg.setWindowTitle(title)
-        msg.exec_()
+    def init_homepage_gige(self):
+        # GigE Camera Test Homepage layout
+        self.homepage_gige = QWidget(self)
+        layout = QVBoxLayout(self.homepage_gige)
 
-    def test_power_usb(self):
-        try:
-            test_powerUSB.test_power()
-            self.show_message("Success", "USB Power Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"USB Power Test Failed: {str(e)}", True)
+        # Camera detection header
+        camera_detection_label = QLabel("Camera Detection (GigE Camera)", self)
+        camera_detection_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(camera_detection_label)
 
-    def test_power_gige(self):
-        try:
-            test_powerGigE.test_power()
-            self.show_message("Success", "GigE Power Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"GigE Power Test Failed: {str(e)}", True)
+        # Button to start camera detection
+        start_gige_detection_button = QPushButton("Start GigE Camera Detection", self)
+        start_gige_detection_button.clicked.connect(self.detect_gige_camera)
+        layout.addWidget(start_gige_detection_button)
 
-    def test_io(self):
-        try:
-            test_IO.test_io_trigger()
-            self.show_message("Success", "I/O Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"I/O Test Failed: {str(e)}", True)
+        # Area to display device information or error message
+        self.device_info_gige = QLabel("", self)
+        layout.addWidget(self.device_info_gige)
 
-    def test_multicam(self):
-        try:
-            test_multicam.test_multicam_acquisition()
-            self.show_message("Success", "Multi-Camera Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"Multi-Camera Test Failed: {str(e)}", True)
+        # Go Back Button
+        go_back_button = QPushButton("Go Back", self)
+        go_back_button.clicked.connect(self.go_back)
+        layout.addWidget(go_back_button)
 
-    def test_image_quality(self):
-        try:
-            test_imgQuality.test_image_quality()
-            self.show_message("Success", "Image Quality Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"Image Quality Test Failed: {str(e)}", True)
+        self.central_widget.addWidget(self.homepage_gige)
 
-    def test_roi(self):
-        try:
-            test_ROI.test_roi_selection()
-            self.show_message("Success", "ROI Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"ROI Test Failed: {str(e)}", True)
+    def start_usb_test(self):
+        # Navigate to USB camera test homepage
+        self.central_widget.setCurrentWidget(self.homepage_usb)
 
-    def blur_detection(self):
-        try:
-            funct_blurDetection.test_blur_detection()
-            self.show_message("Success", "Blur Detection Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"Blur Detection Test Failed: {str(e)}", True)
+    def start_gige_test(self):
+        # Navigate to GigE camera test homepage
+        self.central_widget.setCurrentWidget(self.homepage_gige)
 
-    def edge_detection(self):
-        try:
-            funct_EdgeDetection.test_edge_detection()
-            self.show_message("Success", "Edge Detection Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"Edge Detection Test Failed: {str(e)}", True)
+    def detect_usb_camera(self):
+        # Simulating USB camera detection logic
+        camera_detected = True  # This will be replaced with actual detection logic
 
-    def camera_calibration(self):
-        try:
-            funct_CalibCam.test_camera_calibration()
-            self.show_message("Success", "Camera Calibration Passed")
-        except Exception as e:
-            self.show_message("Error", f"Camera Calibration Failed: {str(e)}", True)
+        if camera_detected:
+            self.display_device_info(self.device_info_usb)
+        else:
+            self.device_info_usb.setText("No camera is detected, please check the following:\n"
+                                         "Device Manager, Network adapters setting, etc.")
 
-    def barcode_scan(self):
-        try:
-            adv_barcodeScan.test_barcode_scan()
-            self.show_message("Success", "Barcode Scan Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"Barcode Scan Test Failed: {str(e)}", True)
+    def detect_gige_camera(self):
+        # Simulating GigE camera detection logic
+        camera_detected = False  # This will be replaced with actual detection logic
 
-    def text_detection(self):
-        try:
-            adv_textDetection.test_text_detection()
-            self.show_message("Success", "Text Detection Test Passed")
-        except Exception as e:
-            self.show_message("Error", f"Text Detection Test Failed: {str(e)}", True)
+        if camera_detected:
+            self.display_device_info(self.device_info_gige)
+        else:
+            self.device_info_gige.setText("No camera is detected, please check the following:\n"
+                                          "Device Manager, Network adapters setting, etc.")
 
+    def display_device_info(self, label):
+        # Displaying simulated device information in table format
+        current_time = QDateTime.currentDateTime()
+
+        device_info = (
+            f"Device Information:\n"
+            f"DeviceID: 12345\n"
+            f"Manufacturer ID: ABC Corp\n"
+            f"MAC address: 00:1B:44:11:3A:B7\n"
+            f"Date: {current_time.toString('yyyy-MM-dd')}\n"
+            f"Time: {current_time.toString('hh:mm:ss')}"
+        )
+        label.setText(device_info)
+
+    def go_back(self):
+        # Navigate back to the welcome screen
+        self.central_widget.setCurrentWidget(self.welcome_page)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

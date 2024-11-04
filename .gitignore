@@ -26,6 +26,8 @@ wheels/
 *.egg
 *.manifest
 *.spec
+PyQt5-5.15.11/
+src/screenshot/
 
 # Installer logs
 pip-log.txt
