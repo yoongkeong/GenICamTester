@@ -28,6 +28,8 @@ wheels/
 *.spec
 PyQt5-5.15.11/
 src/screenshot/
+package.json
+package-lock.json
 
 # Installer logs
 pip-log.txt
