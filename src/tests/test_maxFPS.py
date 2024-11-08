@@ -1,5 +1,6 @@
 import pytest
-from camera_helper import CameraHelper
+from lib.genicam_helper import GenICamHelper
+from lib.camera_helper import CameraHelper
 
 def test_max_fps():
     camera_helper = CameraHelper()

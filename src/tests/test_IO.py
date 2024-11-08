@@ -1,6 +1,7 @@
 import pytest
-from camera_helper import CameraHelper
-from genicam_helper import GenICamHelper
+import pytest
+from lib.genicam_helper import GenICamHelper
+from lib.camera_helper import CameraHelper
 
 @pytest.fixture(scope='module')
 def camera():

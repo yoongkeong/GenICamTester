@@ -1,6 +1,8 @@
 import pytest
 from pypylon import pylon
 import logging
+from lib.genicam_helper import GenICamHelper
+from lib.camera_helper import CameraHelper
 
 @pytest.fixture(scope='module')
 def multicam_setup():

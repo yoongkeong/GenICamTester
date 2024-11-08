@@ -2,6 +2,8 @@ import pytest
 from pypylon import pylon
 import time
 import logging
+from lib.genicam_helper import GenICamHelper
+from lib.camera_helper import CameraHelper
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
