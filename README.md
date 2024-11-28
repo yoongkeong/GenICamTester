@@ -10,11 +10,11 @@ Generic industrial camera (GenICAM) tester based on Pypylon.
 
 <div style="display: flex; justify-content: center; gap: 20px;">
   <div style="text-align: center;">
-    <img src="Tech stack.png" alt="Tech Stack" width="400">
+    <img src="Tech_stack.png" alt="Tech Stack" width="400">
     <p><b>Packages utilised</b></p>
   </div>
   <div style="text-align: center;">
-    <img src="Block diagram.png" alt="Block Diagram" width="400">
+    <img src="Block_diagram.jpg" alt="Block Diagram" width="400">
     <p><b>System diagram</b></p>
   </div>
 </div>
