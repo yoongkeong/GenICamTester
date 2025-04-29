@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GenICam Tester</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>GenICam Tester AI</h1>
+            <nav>
+                <button id="detectCameras">Detect Cameras</button>
+                <button id="startTests">Start Tests</button>
+                <button id="viewResults">View Results</button>
+            </nav>
+        </header>
+        <main>
+            <div id="cameraList" class="section">
+                <h2>Available Cameras</h2>
+                <div id="cameras"></div>
+            </div>
+            <div id="testControls" class="section">
+                <h2>Test Controls</h2>
+                <div class="test-grid">
+                    <div class="test-item">
+                        <input type="checkbox" id="test-init" checked>
+                        <label for="test-init">Camera Initialization</label>
+                    </div>
+                    <div class="test-item">
+                        <input type="checkbox" id="test-acq" checked>
+                        <label for="test-acq">Image Acquisition</label>
+                    </div>
+                    <div class="test-item">
+                        <input type="checkbox" id="test-roi" checked>
+                        <label for="test-roi">ROI Testing</label>
+                    </div>
+                    <div class="test-item">
+                        <input type="checkbox" id="test-features" checked>
+                        <label for="test-features">Feature Access</label>
+                    </div>
+                </div>
+            </div>
+            <div id="results" class="section">
+                <h2>Test Results</h2>
+                <div id="testResults"></div>
+            </div>
+        </main>
+    </div>
+    <script type="module" src="main.js"></script>
+</body>
+</html>

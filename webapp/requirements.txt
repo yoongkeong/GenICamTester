@@ -1,0 +1,11 @@
+fastapi>=0.68.0
+uvicorn>=0.15.0
+python-multipart
+aiofiles
+websockets
+pydantic
+python-dotenv
+# Include existing GenICamTester dependencies
+pypylon
+opencv-python
+loguru
