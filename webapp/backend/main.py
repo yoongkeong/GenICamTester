@@ -5,8 +5,9 @@ import uvicorn
 import sys
 import os
 
-# Add paths for importing local modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+# Add root directory to Python path for imports
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+sys.path.append(ROOT_DIR)
 
 from api_routes import router as api_router
 from websocket_handler import handle_websocket

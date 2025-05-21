@@ -4,3 +4,8 @@ pytest-cov
 opencv-python
 loguru
 pyQt5
+numpy
+pillow
+matplotlib
+typing-extensions
+requests
