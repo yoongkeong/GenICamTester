@@ -17,7 +17,7 @@ app = FastAPI(title="GenICam Tester AI")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["http://localhost:5173"],  # Development server
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,13 +32,14 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
     await handle_websocket(websocket, camera_id)
 
 # Mount static files for frontend
-app.mount("/", StaticFiles(directory="../frontend", html=True), name="static")
+frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="static")
 
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host="localhost",
         port=8000,
         reload=True,
-        reload_dirs=["backend"]
+        reload_dirs=["."]
     )

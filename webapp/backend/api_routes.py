@@ -8,10 +8,17 @@ from datetime import datetime
 # Add parent directory to path to import GenICamTester modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+# Import all test modules
 from src.tests import (
     test_InitCam, test_imageAcq, test_featureAccess, test_ROI,
     test_powerUSB, test_powerGigE, test_multicam, test_maxFPS,
     test_IO, test_imgQuality
+)
+
+# Import functional modules
+from src.funct import (
+    funct_blurDetection, funct_calibCam, funct_edgeDetection,
+    funct_longRun, funct_powercycle
 )
 
 router = APIRouter(prefix="/api")
@@ -124,3 +131,48 @@ async def get_latest_results(camera_id: str):
             latest_results[test.test_name] = test
     
     return {"status": "success", "results": list(latest_results.values())}
+
+@router.post("/functional/blur-detection/{camera_id}")
+async def run_blur_detection(camera_id: str):
+    """Run blur detection on camera feed"""
+    try:
+        result = funct_blurDetection.test_blur_detection(camera_id)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/functional/calibration/{camera_id}")
+async def run_camera_calibration(camera_id: str):
+    """Run camera calibration"""
+    try:
+        result = funct_calibCam.test_camera_calibration(camera_id)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/functional/edge-detection/{camera_id}")
+async def run_edge_detection(camera_id: str):
+    """Run edge detection on camera feed"""
+    try:
+        result = funct_edgeDetection.test_edge_detection(camera_id)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/functional/long-run/{camera_id}")
+async def run_long_run_test(camera_id: str, background_tasks: BackgroundTasks):
+    """Start long-run acquisition test"""
+    try:
+        background_tasks.add_task(funct_longRun.test_long_run_acquisition, camera_id)
+        return {"status": "success", "message": "Long-run test started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/functional/power-cycle/{camera_id}")
+async def run_power_cycle_test(camera_id: str):
+    """Run power cycle test"""
+    try:
+        result = funct_powercycle.test_power_cycle(camera_id)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

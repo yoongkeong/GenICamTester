@@ -1,6 +1,6 @@
 # test_InitCam.py
 import pytest
-from lib.camera_helper import CameraHelper
+from src.lib.camera_helper import CameraHelper
 
 @pytest.fixture(scope='module')
 def camera_config():

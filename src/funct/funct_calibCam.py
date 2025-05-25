@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import pytest
-from camera_helper import CameraHelper
+from src.lib.camera_helper import CameraHelper
 
 def calibrate_camera(images, checkerboard=(7,7)):
     objpoints = []  # 3d points in real world space

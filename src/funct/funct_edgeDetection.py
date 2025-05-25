@@ -1,6 +1,6 @@
 import cv2
 import pytest
-from camera_helper import CameraHelper
+from src.lib.camera_helper import CameraHelper
 
 @pytest.fixture(scope='module')
 def camera():

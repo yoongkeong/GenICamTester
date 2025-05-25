@@ -1,5 +1,5 @@
 import pytest
-from camera_helper import CameraHelper
+from src.lib.camera_helper import CameraHelper
 
 def test_power_cycle():
     camera_helper = CameraHelper()

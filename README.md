@@ -92,3 +92,64 @@ Test Reports: Generate test coverage reports.
 - `README.md` — Overview and setup guide for the project.  
 
 ---
+Frontend backend
+
+GitHub Copilot
+Let me explain the key differences between the frontend and backend in your web application:
+
+Frontend (located in frontend):
+
+Technology Stack:
+
+Built with React and TypeScript (.tsx files)
+Uses Vite as the build tool
+Runs on port 5173 (http://localhost:5173)
+Main Components:
+
+App.tsx: The main application component
+CameraList.tsx: Shows the list of available cameras
+LiveView.tsx: Handles camera live streaming display
+TestPanel.tsx: Interface for running camera tests
+TestResults.tsx: Displays test results
+Responsibilities:
+
+User Interface (what you see in the browser)
+Handling user interactions (clicks, form inputs)
+Making requests to the backend
+Displaying camera streams and test results
+Real-time updates through WebSocket connections
+Backend (located in backend):
+
+Technology Stack:
+
+Built with Python and FastAPI
+Uses WebSockets for real-time communication
+Runs on port 8000 (http://localhost:8000)
+Main Components:
+
+main.py: The FastAPI application entry point
+api_routes.py: Defines the REST API endpoints
+websocket_handler.py: Manages real-time camera streaming
+Responsibilities:
+
+Communicating with the Basler camera through pypylon
+Processing camera images
+Running camera tests
+Sending image data to the frontend
+Managing camera connections
+Handling business logic
+Communication Flow:
+
+For example, when you click "Start Stream" in the frontend:
+
+Frontend sends a WebSocket message to ws://localhost:8000/ws/{camera_id}
+Backend receives this message and starts grabbing images from the camera
+Backend processes these images and sends them back through the WebSocket
+Frontend receives the images and displays them in the LiveView component
+This separation allows:
+
+Better organization of code
+Different teams to work independently
+Scalability and maintainability
+Reuse of the backend with different frontends
+Reuse of the frontend with different camera systems

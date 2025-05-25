@@ -1,7 +1,7 @@
 # test_imageAcq.py
 import pytest
-from lib.genicam_helper import GenICamHelper
-from lib.camera_helper import CameraHelper
+from src.lib.genicam_helper import GenICamHelper
+from src.lib.camera_helper import CameraHelper
 from PyQt5.QtGui import QImage, QPixmap
 
 @pytest.fixture(scope='module')

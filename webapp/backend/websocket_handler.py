@@ -1,7 +1,11 @@
 from fastapi import WebSocket, WebSocketDisconnect
 from typing import Dict, Set
 import json
+import base64
+import cv2
+import numpy as np
 from datetime import datetime
+from src.lib.camera_helper import CameraHelper
 
 class ConnectionManager:
     def __init__(self):
@@ -30,17 +34,48 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def handle_websocket(websocket: WebSocket, camera_id: str):
+    camera_helper = CameraHelper()
+    streaming = False
+    
     await manager.connect(websocket, camera_id)
     try:
+        # Try to connect to the camera
+        try:
+            camera_helper.connect_camera()
+            await websocket.send_json({
+                "type": "camera_status",
+                "status": "connected",
+                "message": "Camera connected successfully"
+            })
+        except Exception as e:
+            await websocket.send_json({
+                "type": "camera_status",
+                "status": "error",
+                "message": str(e)
+            })
+            return
+
         while True:
             data = await websocket.receive_text()
-            # Handle any incoming messages from clients if needed
-            # Currently just echo back
-            await websocket.send_json({
-                "type": "echo",
-                "data": data,
-                "timestamp": datetime.now().isoformat()
-            })
+            message = json.loads(data)
+            
+            if message["type"] == "start_stream":
+                streaming = True
+                while streaming:
+                    if camera_helper.camera and camera_helper.camera.IsGrabbing():
+                        grab_result = camera_helper.camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+                        if grab_result.GrabSucceeded():
+                            image = grab_result.Array
+                            _, buffer = cv2.imencode('.jpg', image)
+                            img_base64 = base64.b64encode(buffer).decode('utf-8')
+                            await websocket.send_json({
+                                "type": "frame",
+                                "data": img_base64,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                        grab_result.Release()
+            elif message["type"] == "stop_stream":
+                streaming = False
     except WebSocketDisconnect:
         manager.disconnect(websocket, camera_id)
 
