@@ -2,6 +2,10 @@
 import pytest
 from src.lib.camera_helper import CameraHelper
 
+def get_available_cameras():
+    """Get a list of all available cameras."""
+    return CameraHelper.get_available_cameras()
+
 @pytest.fixture(scope='module')
 def camera_config():
     # Modify here if you want to change between DHCP or manual configuration.

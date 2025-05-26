@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import { Camera } from '../types';
-import LiveView from './LiveView';
 
 interface CameraListProps {
     onSelectCamera: (camera: Camera) => void;
@@ -11,10 +10,6 @@ const CameraList: React.FC<CameraListProps> = ({ onSelectCamera, selectedCamera 
     const [cameras, setCameras] = useState<Camera[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string>();
-    const [streaming, setStreaming] = useState(false);
-    const [ws, setWs] = useState<WebSocket | null>(null);
-    const [imageData, setImageData] = useState<string>();
-    const [connected, setConnected] = useState(false);
 
     useEffect(() => {
         fetchCameras();
@@ -40,35 +35,28 @@ const CameraList: React.FC<CameraListProps> = ({ onSelectCamera, selectedCamera 
     if (error) return <div className="error">{error}</div>;
 
     return (
-        <div className="camera-container">
-            <div className="camera-list">
-                <h2>Available Cameras</h2>
-                <div className="camera-grid">
-                    {cameras.length === 0 ? (
-                        <div>No cameras detected</div>
-                    ) : (
-                        cameras.map(camera => (
-                            <div 
-                                key={camera.id}
-                                className={`camera-item ${selectedCamera?.id === camera.id ? 'selected' : ''}`}
-                                onClick={() => onSelectCamera(camera)}
-                            >
-                                <h3>{camera.name}</h3>
-                                <p>Interface: {camera.interface}</p>
-                                {camera.model && <p>Model: {camera.model}</p>}
-                                <div className="camera-status">
-                                    <span className={`status-indicator ${camera.status}`} />
-                                    {camera.status}
-                                </div>
-                            </div>
-                        ))
-                    )}
-                </div>
-                <button onClick={fetchCameras} className="refresh-button">
-                    Refresh Camera List
-                </button>
+        <div className="camera-list">
+            <h2>Available Cameras</h2>
+            <button onClick={fetchCameras} className="refresh-button">
+                Refresh Camera List
+            </button>
+            <div className="camera-grid">
+                {cameras.length === 0 ? (
+                    <div>No cameras detected</div>
+                ) : (
+                    cameras.map(camera => (
+                        <div
+                            key={camera.id}
+                            className={`camera-item ${selectedCamera?.id === camera.id ? 'selected' : ''}`}
+                            onClick={() => onSelectCamera(camera)}
+                        >
+                            <h3>{camera.name}</h3>
+                            <p>Serial: {camera.id}</p>
+                            <p>Interface: {camera.interface}</p>
+                        </div>
+                    ))
+                )}
             </div>
-            {selectedCamera && <LiveView camera={selectedCamera} />}
         </div>
     );
 };

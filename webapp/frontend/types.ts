@@ -3,7 +3,6 @@ export interface Camera {
     name: string;
     interface: string;
     model?: string;
-    status: 'available' | 'busy' | 'error';
 }
 
 export interface TestConfig {

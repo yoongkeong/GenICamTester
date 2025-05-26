@@ -44,7 +44,8 @@ test_history: List[TestReport] = []
 async def get_cameras():
     """Get list of available cameras"""
     try:
-        cameras = test_InitCam.get_available_cameras()
+        from src.lib.camera_helper import CameraHelper
+        cameras = CameraHelper.enumerate_cameras()
         return {"status": "success", "cameras": cameras}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

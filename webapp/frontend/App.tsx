@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
 import CameraList from './components/CameraList';
+import LiveView from './components/LiveView';
 import TestPanel from './components/TestPanel';
 import TestResults from './components/TestResults';
 import { Camera, TestResult } from './types';
 
 const App: React.FC = () => {
-    const [selectedCamera, setSelectedCamera] = useState<Camera | null>(null);
+    const [selectedCamera, setSelectedCamera] = useState<Camera | undefined>(undefined);
     const [testResults, setTestResults] = useState<TestResult[]>([]);
 
     const handleCameraSelect = (camera: Camera) => {
@@ -23,24 +24,33 @@ const App: React.FC = () => {
         <div className="app">
             <header className="app-header">
                 <h1>GenICam Tester AI</h1>
-            </header>
-
-            <main className="app-main">
-                <section className="camera-section">
-                    <CameraList 
-                        onSelectCamera={handleCameraSelect}
-                        selectedCamera={selectedCamera}
-                    />
-                </section>
-
-                {selectedCamera && (
-                    <section className="test-section">
-                        <TestPanel
-                            camera={selectedCamera}
-                            onTestComplete={handleTestComplete}
-                        />
-                    </section>
-                )}
+            </header>            <main className="app-main">
+                <div className="main-container">
+                    <div className="left-panel">
+                        <section className="camera-section">
+                            <CameraList 
+                                onSelectCamera={handleCameraSelect}
+                                selectedCamera={selectedCamera}
+                            />
+                        </section>
+                    </div>
+                    
+                    <div className="right-panel">
+                        {selectedCamera && (
+                            <>
+                                <section className="live-section">
+                                    <LiveView camera={selectedCamera} />
+                                </section>
+                                <section className="test-section">
+                                    <TestPanel
+                                        camera={selectedCamera}
+                                        onTestComplete={handleTestComplete}
+                                    />
+                                </section>
+                            </>
+                        )}
+                    </div>
+                </div>
 
                 {testResults.length > 0 && (
                     <section id="results-section" className="results-section">
