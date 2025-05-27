@@ -8,17 +8,11 @@ from datetime import datetime
 # Add parent directory to path to import GenICamTester modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-# Import all test modules
+# Import test modules
 from src.tests import (
     test_InitCam, test_imageAcq, test_featureAccess, test_ROI,
     test_powerUSB, test_powerGigE, test_multicam, test_maxFPS,
     test_IO, test_imgQuality
-)
-
-# Import functional modules
-from src.funct import (
-    funct_blurDetection, funct_calibCam, funct_edgeDetection,
-    funct_longRun, funct_powercycle
 )
 
 router = APIRouter(prefix="/api")
@@ -46,134 +40,78 @@ async def get_cameras():
     try:
         from src.lib.camera_helper import CameraHelper
         cameras = CameraHelper.enumerate_cameras()
-        return {"status": "success", "cameras": cameras}
+        return {
+            "status": "success",
+            "cameras": cameras
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/camera/{camera_id}")
-async def get_camera_info(camera_id: str):
-    """Get detailed information about a specific camera"""
-    try:
-        camera_info = test_InitCam.get_camera_info(camera_id)
-        return {"status": "success", "camera": camera_info}
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
 @router.post("/test/run")
 async def run_tests(config: TestConfig, background_tasks: BackgroundTasks):
-    """Run specified tests on a camera"""
-    test_mapping = {
-        'initialization': test_InitCam.test_camera_init,
-        'image_acquisition': test_imageAcq.test_image_acquisition,
-        'feature_access': test_featureAccess.test_feature_access,
-        'roi': test_ROI.test_roi,
-        'power_usb': test_powerUSB.test_power,
-        'power_gige': test_powerGigE.test_power,
-        'multicam': test_multicam.test_multicam,
-        'max_fps': test_maxFPS.test_max_fps,
-        'io_test': test_IO.test_io,
-        'image_quality': test_imgQuality.test_image_quality
-    }
-
-    results = []
-    for test_name in config.tests:
-        if test_name not in test_mapping:
-            raise HTTPException(status_code=400, detail=f"Unknown test: {test_name}")
+    """Run selected tests for a camera"""
+    try:
+        print(f"Running tests for camera {config.camera_id}: {config.tests}")
+        results = []
         
-        try:
-            test_func = test_mapping[test_name]
-            # Run test with optional parameters
-            if config.parameters and test_name in config.parameters:
-                result = test_func(config.camera_id, **config.parameters[test_name])
-            else:
-                result = test_func(config.camera_id)
+        # Map of test IDs to test classes
+        available_tests = {
+            "initialization": test_InitCam.test_InitCam,
+            "image_acquisition": test_imageAcq.test_imageAcq,
+            "feature_access": test_featureAccess.test_featureAccess,
+            "roi": test_ROI.test_ROI,
+            "power_usb": test_powerUSB.test_powerUSB,
+            "power_gige": test_powerGigE.test_powerGigE,
+            "multicam": test_multicam.test_multicam,
+            "max_fps": test_maxFPS.test_maxFPS,
+            "io_test": test_IO.test_IO,
+            "image_quality": test_imgQuality.test_imgQuality
+        }
 
-            report = TestReport(
-                test_id=f"{config.camera_id}_{test_name}_{datetime.now().timestamp()}",
-                camera_id=config.camera_id,
-                test_name=test_name,
-                status="success",
-                result=result,
-                timestamp=datetime.now()
-            )
-        except Exception as e:
-            report = TestReport(
-                test_id=f"{config.camera_id}_{test_name}_{datetime.now().timestamp()}",
-                camera_id=config.camera_id,
-                test_name=test_name,
-                status="error",
-                result={},
-                timestamp=datetime.now(),
-                error=str(e)
-            )
-        
-        test_history.append(report)
-        results.append(report)
+        # Run each selected test
+        for test_name in config.tests:
+            if test_name in available_tests:
+                print(f"Running test: {test_name}")
+                test_class = available_tests[test_name]()
+                result = test_class.run(config.camera_id, config.parameters)
+                
+                test_report = TestReport(
+                    test_id=f"{test_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    camera_id=config.camera_id,
+                    test_name=test_name,
+                    status="success" if result.get("success", False) else "error",
+                    result=result,
+                    timestamp=datetime.now(),
+                    error=result.get("error")
+                )
+                
+                test_history.append(test_report)
+                results.append(test_report.dict())
+                print(f"Test {test_name} completed with status: {test_report.status}")
 
-    return {"status": "success", "results": results}
+        return {
+            "status": "success",
+            "message": "Tests executed successfully",
+            "results": results
+        }
+    except Exception as e:
+        print(f"Error running tests: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error running tests: {str(e)}"
+        )
 
 @router.get("/test/history/{camera_id}")
 async def get_test_history(camera_id: str):
     """Get test history for a specific camera"""
-    camera_history = [test for test in test_history if test.camera_id == camera_id]
-    return {"status": "success", "history": camera_history}
-
-@router.get("/test/latest/{camera_id}")
-async def get_latest_results(camera_id: str):
-    """Get most recent test results for a camera"""
-    camera_history = [test for test in test_history if test.camera_id == camera_id]
-    if not camera_history:
-        return {"status": "success", "results": []}
-    
-    # Get most recent result for each test type
-    latest_results = {}
-    for test in reversed(camera_history):
-        if test.test_name not in latest_results:
-            latest_results[test.test_name] = test
-    
-    return {"status": "success", "results": list(latest_results.values())}
-
-@router.post("/functional/blur-detection/{camera_id}")
-async def run_blur_detection(camera_id: str):
-    """Run blur detection on camera feed"""
     try:
-        result = funct_blurDetection.test_blur_detection(camera_id)
-        return {"status": "success", "result": result}
+        camera_tests = [test for test in test_history if test.camera_id == camera_id]
+        return {
+            "status": "success",
+            "history": [test.dict() for test in camera_tests]
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/functional/calibration/{camera_id}")
-async def run_camera_calibration(camera_id: str):
-    """Run camera calibration"""
-    try:
-        result = funct_calibCam.test_camera_calibration(camera_id)
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/functional/edge-detection/{camera_id}")
-async def run_edge_detection(camera_id: str):
-    """Run edge detection on camera feed"""
-    try:
-        result = funct_edgeDetection.test_edge_detection(camera_id)
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/functional/long-run/{camera_id}")
-async def run_long_run_test(camera_id: str, background_tasks: BackgroundTasks):
-    """Start long-run acquisition test"""
-    try:
-        background_tasks.add_task(funct_longRun.test_long_run_acquisition, camera_id)
-        return {"status": "success", "message": "Long-run test started"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/functional/power-cycle/{camera_id}")
-async def run_power_cycle_test(camera_id: str):
-    """Run power cycle test"""
-    try:
-        result = funct_powercycle.test_power_cycle(camera_id)
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving test history: {str(e)}"
+        )

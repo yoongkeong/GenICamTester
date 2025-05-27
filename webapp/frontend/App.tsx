@@ -24,39 +24,44 @@ const App: React.FC = () => {
         <div className="app">
             <header className="app-header">
                 <h1>GenICam Tester AI</h1>
-            </header>            <main className="app-main">
+            </header>
+            
+            <main className="app-main">
                 <div className="main-container">
-                    <div className="left-panel">
-                        <section className="camera-section">
+                    {/* Camera selection and live view */}
+                    <section className="camera-controls">
+                        <div className="camera-list-container">
                             <CameraList 
                                 onSelectCamera={handleCameraSelect}
                                 selectedCamera={selectedCamera}
                             />
-                        </section>
-                    </div>
-                    
-                    <div className="right-panel">
+                        </div>
+                        
                         {selectedCamera && (
-                            <>
-                                <section className="live-section">
-                                    <LiveView camera={selectedCamera} />
-                                </section>
-                                <section className="test-section">
-                                    <TestPanel
-                                        camera={selectedCamera}
-                                        onTestComplete={handleTestComplete}
-                                    />
-                                </section>
-                            </>
+                            <div className="camera-view-container">
+                                <LiveView camera={selectedCamera} />
+                            </div>
                         )}
-                    </div>
-                </div>
-
-                {testResults.length > 0 && (
-                    <section id="results-section" className="results-section">
-                        <TestResults results={testResults} />
                     </section>
-                )}
+
+                    {/* Test controls and results */}
+                    {selectedCamera && (
+                        <section className="test-controls">
+                            <div className="test-panel-container">
+                                <TestPanel
+                                    camera={selectedCamera}
+                                    onTestComplete={handleTestComplete}
+                                />
+                            </div>
+                            
+                            {testResults.length > 0 && (
+                                <div id="results-section" className="test-results-container">
+                                    <TestResults results={testResults} />
+                                </div>
+                            )}
+                        </section>
+                    )}
+                </div>
             </main>
 
             <footer className="app-footer">
@@ -65,3 +70,5 @@ const App: React.FC = () => {
         </div>
     );
 };
+
+export default App;

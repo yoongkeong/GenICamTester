@@ -53,11 +53,14 @@ async def handle_websocket(websocket: WebSocket, camera_id: str):
                 break
         
         if not target_device:
+            print(f"Camera {camera_id} not found in available devices: {cameras}")
             await websocket.send_json({"error": "Camera not found"})
             return
         
-        # Connect to the camera
-        camera_helper.connect_camera()
+        print(f"Connecting to camera {camera_id}...")
+        # Connect to the specific camera
+        camera_helper.connect_camera(camera_id)
+        print(f"Successfully connected to camera {camera_id}")
         
         while True:
             try:
@@ -67,48 +70,56 @@ async def handle_websocket(websocket: WebSocket, camera_id: str):
                 
                 if command == 'start_stream':
                     if not streaming:
+                        print(f"Starting stream for camera {camera_id}...")
                         camera_helper.start_grabbing()
                         streaming = True
                         # Start streaming in background task
-                        asyncio.create_task(stream_frames(websocket, camera_helper))
+                        stream_task = asyncio.create_task(stream_frames(websocket, camera_helper))
                         await websocket.send_json({"status": "streaming_started"})
+                        print(f"Stream started for camera {camera_id}")
                 
                 elif command == 'stop_stream':
                     if streaming:
+                        print(f"Stopping stream for camera {camera_id}...")
                         camera_helper.stop_grabbing()
                         streaming = False
                         await websocket.send_json({"status": "streaming_stopped"})
+                        print(f"Stream stopped for camera {camera_id}")
                 
                 elif command == 'get_status':
-                    await websocket.send_json({
+                    status_msg = {
                         "status": "streaming" if streaming else "ready",
                         "camera_id": camera_id,
                         "camera_name": target_device['name']
-                    })
+                    }
+                    await websocket.send_json(status_msg)
+                    print(f"Status sent for camera {camera_id}: {status_msg}")
             
             except WebSocketDisconnect:
+                print(f"WebSocket disconnected for camera {camera_id}")
                 break
             except Exception as e:
-                await websocket.send_json({"error": str(e)})
+                error_msg = str(e)
+                print(f"Error in websocket handler for camera {camera_id}: {error_msg}")
+                await websocket.send_json({"error": error_msg})
                 break
     
     finally:
+        print(f"Cleaning up connection for camera {camera_id}")
         if streaming:
             camera_helper.stop_grabbing()
         camera_helper.disconnect_camera()
         manager.disconnect(websocket, camera_id)
 
 async def stream_frames(websocket: WebSocket, camera_helper: CameraHelper):
-    """Background task to continuously stream frames."""
+    """Stream frames from the camera over websocket."""
     try:
         while True:
-            if not camera_helper.camera.IsGrabbing():
-                break
-                
+            # Get frame from camera
             frame = camera_helper.get_frame()
             if frame is not None:
-                # Encode frame as JPEG
-                success, buffer = cv2.imencode('.jpg', frame)
+                # Convert to JPEG format
+                success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if success:
                     # Convert to base64 and send
                     base64_image = base64.b64encode(buffer).decode('utf-8')
@@ -117,13 +128,19 @@ async def stream_frames(websocket: WebSocket, camera_helper: CameraHelper):
                         "data": base64_image,
                         "timestamp": datetime.now().isoformat()
                     })
+                else:
+                    print("Failed to encode frame")
             
-            # Add a small delay to control frame rate
+            # Add a small delay to control frame rate (adjust as needed)
             await asyncio.sleep(0.033)  # ~30 FPS
-    
+    except WebSocketDisconnect:
+        print("WebSocket disconnected during streaming")
     except Exception as e:
-        print(f"Streaming error: {e}")
-        await websocket.send_json({"error": str(e)})
+        print(f"Error in stream_frames: {e}")
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception as send_error:
+            print(f"Error sending error message: {send_error}")
 
 async def send_test_update(camera_id: str, test_name: str, status: str, message: str, data: dict = None):
     """Send a test update to all clients watching a specific camera"""

@@ -50,98 +50,61 @@ const TestPanel: React.FC<TestPanelProps> = ({ camera, onTestComplete }) => {
             .map(test => test.id)
     );
     const [running, setRunning] = useState(false);
-    const [progress, setProgress] = useState<{[key: string]: string}>({});
+    const [error, setError] = useState<string>();
 
-    const toggleTest = (testId: string) => {
-        setSelectedTests(current =>
-            current.includes(testId)
-                ? current.filter(id => id !== testId)
-                : [...current, testId]
-        );
-    };
-
-    const toggleCategory = (tests: typeof testCategories[keyof typeof testCategories]['tests']) => {
-        const testIds = tests.map(t => t.id);
-        const allSelected = testIds.every(id => selectedTests.includes(id));
-        
-        setSelectedTests(current => 
-            allSelected
-                ? current.filter(id => !testIds.includes(id))
-                : [...new Set([...current, ...testIds])]
+    const handleTestSelection = (testId: string) => {
+        setSelectedTests(prev => 
+            prev.includes(testId) 
+                ? prev.filter(id => id !== testId)
+                : [...prev, testId]
         );
     };
 
     const runTests = async () => {
-        if (running) return;
         setRunning(true);
-        setProgress({});
-
+        setError(undefined);
+        
         try {
-            // Setup WebSocket for real-time updates
-            const ws = new WebSocket(`ws://localhost:8000/ws/${camera.id}`);
-            ws.onmessage = (event) => {
-                const update = JSON.parse(event.data);
-                if (update.type === 'test_update') {
-                    setProgress(prev => ({
-                        ...prev,
-                        [update.test_name]: update.status
-                    }));
-                }
-            };
+            // First initialize the camera
+            const initResponse = await fetch(`http://localhost:8000/api/test/run`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    camera_id: camera.id,
+                    tests: ['init'],
+                    parameters: {}
+                })
+            });
 
-            // Run basic tests first
-            const basicTestsConfig: TestConfig = {
-                camera_id: camera.id,
-                tests: selectedTests.filter(test => 
-                    testCategories.basic.tests.some(t => t.id === test)
-                )
-            };
-            
-            if (basicTestsConfig.tests.length > 0) {
-                const basicResponse = await fetch('/api/test/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(basicTestsConfig)
-                });
-                const basicData = await basicResponse.json();
-                if (basicData.status !== 'success') throw new Error('Basic tests failed');
+            const initData = await initResponse.json();
+            if (initData.status !== 'success') {
+                throw new Error(initData.message || 'Failed to initialize camera');
             }
 
-            // Run functional tests
-            const functionalTests = selectedTests.filter(test => 
-                testCategories.functional.tests.some(t => t.id === test)
-            );
+            // Then run the selected tests
+            const response = await fetch(`http://localhost:8000/api/test/run`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    camera_id: camera.id,
+                    tests: selectedTests,
+                    parameters: {}
+                })
+            });
 
-            for (const test of functionalTests) {
-                await fetch(`/api/functional/${test}/${camera.id}`, {
-                    method: 'POST'
-                });
+            const data = await response.json();
+            if (data.status === 'success') {
+                onTestComplete(data.results);
+            } else {
+                throw new Error(data.message || 'Test execution failed');
             }
-
-            // Run remaining tests
-            const remainingTestsConfig: TestConfig = {
-                camera_id: camera.id,
-                tests: selectedTests.filter(test => 
-                    [...testCategories.performance.tests, ...testCategories.advanced.tests]
-                        .some(t => t.id === test)
-                )
-            };
-
-            if (remainingTestsConfig.tests.length > 0) {
-                const response = await fetch('/api/test/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(remainingTestsConfig)
-                });
-                const data = await response.json();
-                if (data.status === 'success') {
-                    onTestComplete(data.results);
-                }
-            }
-
-            ws.close();
-        } catch (error) {
-            console.error('Test execution failed:', error);
+        } catch (err) {
+            console.error('Test execution error:', err);
+            setError(err.message || 'Failed to run tests');
         } finally {
             setRunning(false);
         }
@@ -149,3 +112,39 @@ const TestPanel: React.FC<TestPanelProps> = ({ camera, onTestComplete }) => {
 
     return (
         <div className="test-panel">
+            <h2>Test Controls</h2>
+            {error && <div className="error-message">{error}</div>}
+            <div className="test-categories">
+                {Object.entries(testCategories).map(([category, { title, tests }]) => (
+                    <div key={category} className="test-category">
+                        <h3>{title}</h3>
+                        <div className="test-list">
+                            {tests.map(test => (
+                                <label key={test.id} className="test-item">
+                                    <input
+                                        type="checkbox"
+                                        checked={selectedTests.includes(test.id)}
+                                        onChange={() => handleTestSelection(test.id)}
+                                        disabled={running}
+                                    />
+                                    {test.name}
+                                </label>
+                            ))}
+                        </div>
+                    </div>
+                ))}
+            </div>
+            <div className="test-controls">
+                <button 
+                    onClick={runTests} 
+                    disabled={running || selectedTests.length === 0}
+                    className={running ? 'running' : ''}
+                >
+                    {running ? 'Running Tests...' : 'Start Tests'}
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default TestPanel;
