@@ -1,87 +1,112 @@
 # test_InitCam.py
+import pytest
+import time
 import sys
 import os
-from datetime import datetime
-from src.lib.camera_helper import CameraHelper
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from lib.camera_helper import CameraHelper
 
-class test_InitCam:
+class TestInitializeCamera:
     def __init__(self):
         self.camera_helper = None
-        
-    def run(self, camera_id: str, parameters: dict = None):
-        """Run the camera initialization test
-        
-        Args:
-            camera_id (str): The ID of the camera to test
-            parameters (dict, optional): Additional test parameters. Defaults to None.
-            
-        Returns:
-            dict: Test results containing success status and details
-        """
-        try:
-            self.camera_helper = CameraHelper()
-            
-            # Get all cameras
-            cameras = CameraHelper.enumerate_cameras()
-            target_device = None
-            
-            # Find the camera with matching ID
-            for device in cameras:
-                if device['id'] == camera_id:
-                    target_device = device
+        self.init_attempts = 3  # Number of initialization attempts
+        self.init_delay = 1     # Delay between attempts in seconds
+
+    def set_test_parameters(self, attempts=3, delay=1):
+        """Set test parameters"""
+        self.init_attempts = attempts
+        self.init_delay = delay
+
+    def test_initialization(self, ip_address=None):
+        """Test camera initialization"""
+        results = {
+            "success": False,
+            "attempts": 0,
+            "error": None,
+            "connection_time": 0
+        }
+
+        for attempt in range(self.init_attempts):
+            try:
+                results["attempts"] += 1
+                
+                # Create new CameraHelper instance
+                self.camera_helper = CameraHelper()
+                
+                # Record start time
+                start_time = time.time()
+                
+                # Try to connect
+                if ip_address:
+                    self.camera_helper.connect_camera(ip_address=ip_address)
+                else:
+                    self.camera_helper.connect_camera()
+                
+                # Calculate connection time
+                results["connection_time"] = time.time() - start_time
+                
+                # Verify camera is operational
+                if self.verify_camera():
+                    results["success"] = True
                     break
+                
+            except Exception as e:
+                results["error"] = str(e)
+                
+                # Clean up before next attempt
+                if self.camera_helper:
+                    try:
+                        self.camera_helper.disconnect_camera()
+                    except:
+                        pass
+                self.camera_helper = None
+                
+                # Wait before next attempt
+                if attempt < self.init_attempts - 1:
+                    time.sleep(self.init_delay)
+
+        return results
+
+    def verify_camera(self):
+        """Verify camera is operational by capturing a test image"""
+        try:
+            if not self.camera_helper or not self.camera_helper.camera:
+                return False
             
-            if not target_device:
-                return {
-                    "success": False,
-                    "error": f"Camera {camera_id} not found",
-                    "details": {
-                        "available_cameras": cameras
-                    }
-                }
+            # Try to capture an image
+            grab_result = self.camera_helper.camera.GrabOne(1000)
+            success = grab_result and grab_result.GrabSucceeded()
             
-            # Connect to camera
-            print(f"Connecting to camera {camera_id}...")
-            self.camera_helper.connect_camera(camera_id)
+            # Clean up
+            if grab_result:
+                grab_result.Release()
+                
+            return success
             
-            # Verify camera is open
-            if not self.camera_helper.camera.IsOpen():
-                return {
-                    "success": False,
-                    "error": "Camera failed to initialize",
-                    "details": {
-                        "camera_id": camera_id,
-                        "device_info": target_device
-                    }
-                }
-            
-            # Get camera info
-            camera_info = {
-                "vendor": self.camera_helper.camera.GetDeviceInfo().GetVendorName(),
-                "model": self.camera_helper.camera.GetDeviceInfo().GetModelName(),
-                "serial": self.camera_helper.camera.GetDeviceInfo().GetSerialNumber(),
-                "firmware": self.camera_helper.camera.GetDeviceInfo().GetFirmwareVersion()
-            }
-            
-            return {
-                "success": True,
-                "message": "Camera initialized successfully",
-                "details": {
-                    "camera_id": camera_id,
-                    "device_info": camera_info,
-                    "timestamp": datetime.now().isoformat()
-                }
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "details": {
-                    "camera_id": camera_id,
-                    "exception_type": type(e).__name__
-                }
-            }
-        finally:
-            if self.camera_helper:
+        except Exception:
+            return False
+
+    def cleanup(self):
+        """Clean up camera resources"""
+        if self.camera_helper:
+            try:
                 self.camera_helper.disconnect_camera()
+            except:
+                pass
+            self.camera_helper = None
+
+# Test fixtures and functions for pytest
+@pytest.fixture(scope='function')
+def init_test():
+    test = TestInitializeCamera()
+    yield test
+    test.cleanup()
+
+def test_camera_initialization(init_test):
+    results = init_test.test_initialization()
+    assert results["success"], f"Camera initialization failed after {results['attempts']} attempts"
+    assert results["connection_time"] > 0, "Connection time not recorded"
+
+def test_camera_verification(init_test):
+    init_test.test_initialization()
+    assert init_test.verify_camera(), "Camera verification failed"

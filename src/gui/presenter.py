@@ -1,54 +1,175 @@
 # presenter.py
 import sys
 import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtCore import QTimer
 from pypylon import pylon
-from tests.test_imageAcq import test_imageAcq 
+import cv2
+import numpy as np
 
 class CameraPresenter:
     def __init__(self, view):
         self.view = view  # Reference to the CameraTestGUI instance
         self.camera = None
+        self.camera_helper = None
+        self.driver_helper = None
+        self.genicam_helper = None
+        self.live_timer = None
+        self.is_live_grabbing = False
+        self._init_logging()
 
-    def detect_gige_camera(self):
-        try:
-            self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-            if self.camera.IsOpen():
-                camera_info = (
-                    f"Camera detected:\nSerial Number: {self.camera.GetDeviceInfo().GetSerialNumber()}"
-                    f"\nManufacturer: {self.camera.GetDeviceInfo().GetVendorName()}"
-                )
-                self.view.display_camera_info(camera_info)
-                self.view.navigate_to_test_selection()
-        except Exception:
-            self.prompt_ip_configuration()
+    def _init_logging(self):
+        """Initialize logging for the presenter"""
+        import logging
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Add console handler if not already added
+        if not self.logger.handlers:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+
+    def set_camera_helper(self, helper):
+        self.camera_helper = helper
+        self.logger.info("Camera helper set")
+
+    def set_driver_helper(self, helper):
+        self.driver_helper = helper
+        self.logger.info("Driver helper set")
+
+    def set_genicam_helper(self, helper):
+        self.genicam_helper = helper
+        self.logger.info("GenICam helper set")
+
+    def add_functionality(self, name, func):
+        setattr(self, name, func)
+        self.logger.debug(f"Added functionality: {name}")
+
+    def add_test(self, name, test):
+        setattr(self, name, test)
+        self.logger.debug(f"Added test: {name}")
 
     def detect_usb_camera(self):
         try:
-            self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-            if self.camera.IsOpen():
-                camera_info = (
-                    f"Camera detected:\nSerial Number: {self.camera.GetDeviceInfo().GetSerialNumber()}"
-                    f"\nManufacturer: {self.camera.GetDeviceInfo().GetVendorName()}"
-                )
-                self.view.display_camera_info(camera_info)
-                self.view.navigate_to_test_selection()
-        except Exception:
-            QMessageBox.warning(self.view, "USB Camera Detection", "No USB camera detected.")
-
-    def start_image_acquisition(self):
-        """Starts image acquisition and displays result in the GUI."""
-        try:
-            result = test_image_acquisition(self.camera)
-            if result:
-                self.view.display_image(result)
-            else:
-                QMessageBox.warning(self.view, "Image Acquisition", "Failed to acquire image.")
+            self.logger.info("Detecting USB cameras...")
+            cameras = self.camera_helper.enumerate_cameras()
+            self.logger.debug(f"Found cameras: {cameras}")
+            
+            # Look for any USB-related interface types
+            usb_cameras = [cam for cam in cameras 
+                         if any(usb_type in cam['interface'].lower() 
+                               for usb_type in ['usb', 'baslerusb', 'genapi'])]
+            self.logger.debug(f"Found USB cameras: {usb_cameras}")
+            
+            if not usb_cameras:
+                self.logger.warning("No USB cameras found")
+                QMessageBox.warning(self.view, "USB Camera Detection", "No USB cameras found.")
+                return
+            
+            # Connect to the first USB camera
+            self.logger.info(f"Connecting to USB camera: {usb_cameras[0]['id']}")
+            self.camera_helper.connect_camera(usb_cameras[0]['id'])
+            camera_info = (
+                f"Camera detected:\nSerial Number: {usb_cameras[0]['id']}\n"
+                f"Model: {usb_cameras[0]['name']}\n"
+                f"Interface: {usb_cameras[0]['interface']}\n"
+                f"Full Name: {usb_cameras[0].get('full_name', 'N/A')}"
+            )
+            self.view.display_camera_info(camera_info)
+            self.view.navigate_to_test_selection()
+            
         except Exception as e:
-            QMessageBox.critical(self.view, "Error", f"Image acquisition failed: {e}")
+            self.logger.error(f"USB camera detection error: {str(e)}")
+            QMessageBox.critical(self.view, "Error", f"Failed to connect to USB camera: {str(e)}")
 
-    def show_test_result(self, test_name, result):
-        QMessageBox.information(self.view, f"{test_name} Result", str(result))
+    def detect_gige_camera(self, use_dhcp=True, ip_settings=None):
+        try:
+            self.logger.info("Detecting GigE cameras...")
+            cameras = self.camera_helper.enumerate_cameras()
+            self.logger.debug(f"Found cameras: {cameras}")
+            
+            gige_cameras = [cam for cam in cameras if 'GigE' in cam['interface']]
+            self.logger.debug(f"Found GigE cameras: {gige_cameras}")
+            
+            if not gige_cameras:
+                self.logger.warning("No GigE cameras found")
+                QMessageBox.warning(self.view, "GigE Camera Detection", "No GigE cameras found.")
+                return
+            
+            # Connect to the first GigE camera
+            self.logger.info(f"Connecting to GigE camera: {gige_cameras[0]['id']}")
+            self.camera_helper.connect_camera(gige_cameras[0]['id'])
+            camera_info = (
+                f"Camera detected:\nSerial Number: {gige_cameras[0]['id']}\n"
+                f"Model: {gige_cameras[0]['name']}\n"
+                f"Interface: {gige_cameras[0]['interface']}\n"
+                f"IP Address: {gige_cameras[0].get('ip_address', 'N/A')}\n"
+                f"Full Name: {gige_cameras[0].get('full_name', 'N/A')}"
+            )
+            self.view.display_camera_info(camera_info)
+            self.view.navigate_to_test_selection()
+            
+        except Exception as e:
+            self.logger.error(f"GigE camera detection error: {str(e)}")
+            QMessageBox.critical(self.view, "Error", f"Failed to connect to GigE camera: {str(e)}")
 
-    def prompt_ip_configuration(self):
-        QMessageBox.warning(self.view, "GigE Camera Detection", "No GigE camera detected. Please configure IP settings.")
+    def start_live_grabbing(self):
+        """Start live image grabbing"""
+        try:
+            if not self.is_live_grabbing:
+                self.logger.info("Starting live grabbing")
+                if not self.camera_helper:
+                    raise RuntimeError("Camera helper not initialized")
+                self.camera_helper.start_grabbing()
+                self.is_live_grabbing = True
+                
+                # Create timer for live view updates
+                self.live_timer = QTimer()
+                self.live_timer.timeout.connect(self.update_live_view)
+                self.live_timer.start(33)  # ~30 FPS
+                
+                self.view.update_live_button_state(True)
+        except Exception as e:
+            self.logger.error(f"Failed to start live grabbing: {str(e)}")
+            QMessageBox.critical(self.view, "Error", f"Failed to start live grabbing: {str(e)}")
+            self.stop_live_grabbing()
+
+    def stop_live_grabbing(self):
+        """Stop live image grabbing"""
+        try:
+            if self.is_live_grabbing:
+                self.logger.info("Stopping live grabbing")
+                if self.live_timer:
+                    self.live_timer.stop()
+                    self.live_timer = None
+                
+                if self.camera_helper:
+                    self.camera_helper.stop_grabbing()
+                self.is_live_grabbing = False
+                self.view.update_live_button_state(False)
+        except Exception as e:
+            self.logger.error(f"Failed to stop live grabbing: {str(e)}")
+            QMessageBox.critical(self.view, "Error", f"Failed to stop live grabbing: {str(e)}")
+
+    def update_live_view(self):
+        """Update the live view with the latest frame"""
+        try:
+            if self.is_live_grabbing and self.camera_helper:
+                frame = self.camera_helper.get_frame()
+                if frame is not None:
+                    self.view.update_live_image(frame)
+        except Exception as e:
+            self.logger.error(f"Error updating live view: {str(e)}")
+            self.stop_live_grabbing()
+
+    def cleanup(self):
+        """Clean up resources"""
+        self.logger.info("Cleaning up resources")
+        self.stop_live_grabbing()
+        if self.camera_helper:
+            self.camera_helper.disconnect_camera()

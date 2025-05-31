@@ -29,17 +29,22 @@ def main():
     # Initialize CameraTestGUI
     gui = CameraTestGUI()
     
+    # Initialize and set up helpers
+    camera_helper = CameraHelper()
+    driver_helper = DriverHelper()
+    genicam_helper = GenICamHelper()
+    
+    # Set up helpers in the presenter
+    gui.presenter.set_camera_helper(camera_helper)
+    gui.presenter.set_driver_helper(driver_helper)
+    gui.presenter.set_genicam_helper(genicam_helper)
+    
     # Initialize functional modules
     blur_detection = BlurDetection()
     camera_calibration = CameraCalibration()
     edge_detection = EdgeDetection()
     long_run_test = LongRunTest()
     power_cycle_test = PowerCycleTest()
-
-    # Initialize libraries
-    camera_helper = CameraHelper()
-    driver_helper = DriverHelper()
-    genicam_helper = GenICamHelper()
 
     # Initialize test modules
     test_feature_access = TestFeatureAccess()
