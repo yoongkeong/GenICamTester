@@ -8,6 +8,7 @@ from PyQt5.QtCore import QTimer
 from pypylon import pylon
 import cv2
 import numpy as np
+import time
 
 class CameraPresenter:
     def __init__(self, view):
@@ -18,6 +19,11 @@ class CameraPresenter:
         self.genicam_helper = None
         self.live_timer = None
         self.is_live_grabbing = False
+        self.is_long_run_test = False
+        self.long_run_start_time = None
+        self.long_run_frame_count = 0
+        self.long_run_last_fps_update = None
+        self.long_run_last_frame_count = 0
         self._init_logging()
 
     def _init_logging(self):
@@ -166,6 +172,93 @@ class CameraPresenter:
         except Exception as e:
             self.logger.error(f"Error updating live view: {str(e)}")
             self.stop_live_grabbing()
+
+    def start_long_run_test(self):
+        """Start long run test with live frame grabbing"""
+        try:
+            self.logger.info("Starting long run test")
+            self.view.log_message("Starting long run test")
+            self.is_long_run_test = True
+            self.long_run_start_time = time.time()
+            self.long_run_frame_count = 0
+            self.long_run_last_fps_update = time.time()
+            self.long_run_last_frame_count = 0
+            
+            # Start grabbing if not already grabbing
+            if self.camera_helper and not self.camera_helper.camera.IsGrabbing():
+                self.camera_helper.start_grabbing()
+                
+        except Exception as e:
+            self.logger.error(f"Error starting long run test: {str(e)}")
+            self.view.log_message(f"Error starting long run test: {str(e)}", "ERROR")
+            
+    def stop_long_run_test(self):
+        """Stop long run test"""
+        try:
+            self.logger.info("Stopping long run test")
+            self.view.log_message("Long run test stopped")
+            self.is_long_run_test = False
+            if self.camera_helper:
+                self.camera_helper.stop_grabbing()
+                
+            # Log final statistics
+            stats = self.get_long_run_stats()
+            self.view.log_message(
+                f"Test completed - Total frames: {stats['frames_captured']:,}, "
+                f"Average FPS: {stats['average_fps']:.1f}")
+                
+        except Exception as e:
+            self.logger.error(f"Error stopping long run test: {str(e)}")
+            self.view.log_message(f"Error stopping long run test: {str(e)}", "ERROR")
+            
+    def get_long_run_stats(self):
+        """Get current statistics for long run test"""
+        try:
+            current_time = time.time()
+            elapsed = current_time - self.long_run_start_time
+            
+            # Calculate current FPS over the last second
+            frames_since_last = self.long_run_frame_count - self.long_run_last_frame_count
+            time_since_last = current_time - self.long_run_last_fps_update
+            current_fps = frames_since_last / time_since_last if time_since_last > 0 else 0
+            
+            # Calculate average FPS
+            average_fps = self.long_run_frame_count / elapsed if elapsed > 0 else 0
+            
+            # Update last values
+            self.long_run_last_fps_update = current_time
+            self.long_run_last_frame_count = self.long_run_frame_count
+            
+            # Log progress every minute
+            if int(elapsed) % 60 == 0:
+                self.view.log_message(
+                    f"Long run test progress - Frames: {self.long_run_frame_count:,}, "
+                    f"Current FPS: {current_fps:.1f}")
+            
+            return {
+                "elapsed_time": elapsed,
+                "frames_captured": self.long_run_frame_count,
+                "current_fps": current_fps,
+                "average_fps": average_fps
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting long run stats: {str(e)}")
+            return {}
+
+    def get_current_frame(self):
+        """Get the current frame from the camera"""
+        try:
+            if self.camera_helper and self.camera_helper.camera:
+                frame = self.camera_helper.get_frame(increment_count=self.is_long_run_test)
+                if frame is not None:
+                    # If this is part of a long run test, increment the frame counter
+                    if self.is_long_run_test:
+                        self.long_run_frame_count += 1
+                return frame
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting current frame: {str(e)}")
+            return None
 
     def cleanup(self):
         """Clean up resources"""

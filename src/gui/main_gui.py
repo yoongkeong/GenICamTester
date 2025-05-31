@@ -1,13 +1,13 @@
 # main_gui.py
 
-import sys
+import sys, time
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QStackedWidget, QDialog, QLineEdit, QDialogButtonBox, QFormLayout, 
-    QMessageBox, QGroupBox
+    QMessageBox, QGroupBox, QTextEdit, QProgressBar, QSpinBox, QSplitter, QFrame
 )
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, QDateTime
 import cv2
 import numpy as np
 from gui.presenter import CameraPresenter
@@ -15,48 +15,285 @@ from gui.presenter import CameraPresenter
 class CameraTestGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Import required modules
+        from PyQt5.QtWidgets import QTextEdit, QSplitter
+        from PyQt5.QtCore import QDateTime
+        
+        self.init_styles()
         self.presenter = CameraPresenter(self)
         self.initUI()
 
+    def init_styles(self):
+        """Initialize application-wide styles"""
+        # Define the color palette based on Basler web theme
+        self.style_dict = {
+            'primary': '#00427E',      # Basler blue
+            'secondary': '#005CAB',    # Lighter blue
+            'success': '#4CAF50',      # Green
+            'warning': '#FFC107',      # Amber
+            'error': '#DC3545',        # Red
+            'background': '#F8F9FA',   # Light gray
+            'text': '#333333',         # Dark gray
+            'border': '#E9ECEF',       # Light border
+            'white': '#FFFFFF',
+            'dark-bg': '#1A1A1A'       # Dark background
+        }
+        
+        # Set application style
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {self.style_dict['background']};
+            }}
+            
+            QLabel {{
+                color: {self.style_dict['text']};
+                font-size: 12px;
+            }}
+            
+            QLabel[title="true"] {{
+                font-size: 24px;
+                font-weight: bold;
+                color: {self.style_dict['primary']};
+                margin: 20px;
+            }}
+            
+            QPushButton {{
+                background-color: {self.style_dict['primary']};
+                color: {self.style_dict['white']};
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 14px;
+                min-width: 120px;
+            }}
+            
+            QPushButton:hover {{
+                background-color: {self.style_dict['secondary']};
+            }}
+            
+            QPushButton:disabled {{
+                background-color: {self.style_dict['border']};
+            }}
+            
+            QGroupBox {{
+                background-color: {self.style_dict['white']};
+                border-radius: 8px;
+                padding: 12px;
+                margin-top: 16px;
+                font-weight: bold;
+            }}
+            
+            QProgressBar {{
+                border: 1px solid {self.style_dict['border']};
+                border-radius: 4px;
+                text-align: center;
+            }}
+            
+            QProgressBar::chunk {{
+                background-color: {self.style_dict['secondary']};
+            }}
+        """)
+
     def initUI(self):
         self.setWindowTitle("GenICam Camera Tester")
-        self.setGeometry(100, 100, 1024, 768)
+        self.setGeometry(100, 100, 1200, 800)  # Increased default size
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.stacked_widget = QStackedWidget()
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.addWidget(self.stacked_widget)
+        
+        # Create header
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        
+        # Add logo (you can replace this with your actual logo)
+        logo_label = QLabel("GenICam")
+        logo_label.setStyleSheet(f"""
+            font-size: 28px;
+            font-weight: bold;
+            color: {self.style_dict['primary']};
+        """)
+        header_layout.addWidget(logo_label)
+        
+        # Add version info
+        version_label = QLabel("v1.0.0")
+        version_label.setStyleSheet(f"color: {self.style_dict['secondary']};")
+        header_layout.addWidget(version_label)
+        header_layout.addStretch()
+        
+        self.main_layout.addWidget(header)
 
+        # Create a splitter for main content and log viewer
+        self.splitter = QSplitter(Qt.Vertical)
+        
+        # Add stacked widget to splitter
+        self.stacked_widget = QStackedWidget()
+        self.splitter.addWidget(self.stacked_widget)
+        
+        # Initialize and add log viewer
+        self.init_log_viewer()
+        self.splitter.addWidget(self.log_viewer)
+        
+        # Add splitter to main layout
+        self.main_layout.addWidget(self.splitter)
+
+        # Initialize pages
+        self.init_welcome_page()
         self.init_camera_detection_page()
         self.init_test_selection_page()
         self.init_live_view_page()
 
-        self.stacked_widget.setCurrentWidget(self.camera_detection_page)
+        self.stacked_widget.setCurrentWidget(self.welcome_page)
+        
+        # Set initial splitter sizes (70% main content, 30% log)
+        self.splitter.setSizes([int(self.height() * 0.7), int(self.height() * 0.3)])
+        
+    def init_welcome_page(self):
+        """Initialize welcome page with software description"""
+        self.welcome_page = QWidget()
+        layout = QVBoxLayout(self.welcome_page)
+        layout.setContentsMargins(40, 40, 40, 40)  # Add some padding
+        
+        # Welcome title
+        title = QLabel("Welcome to GenICam Camera Tester")
+        title.setProperty('title', True)  # Used for styling
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Software description
+        description = QTextEdit()
+        description.setReadOnly(True)
+        description.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {self.style_dict['white']};
+                border: none;
+                border-radius: 8px;
+                padding: 16px;
+                font-size: 14px;
+            }}
+        """)
+        
+        description_text = """
+        <h2 style='color: #00427E;'>About GenICam Camera Tester</h2>
+        <p>GenICam Camera Tester is a comprehensive testing suite designed for Basler cameras using the GenICam standard. 
+        This software provides tools for:</p>
+        <ul>
+            <li>Camera detection and connection (USB and GigE)</li>
+            <li>Live image viewing and capture</li>
+            <li>Image quality assessment</li>
+            <li>Performance testing</li>
+            <li>Long-duration stability testing</li>
+            <li>Feature access verification</li>
+        </ul>
+        <p>Click the button below to start by detecting your camera.</p>
+        """
+        description.setHtml(description_text)
+        layout.addWidget(description)
+        
+        # Get Started button
+        start_button = QPushButton("Get Started")
+        start_button.setMinimumHeight(40)
+        start_button.clicked.connect(lambda: self.stacked_widget.setCurrentWidget(self.camera_detection_page))
+        
+        button_container = QWidget()
+        button_layout = QHBoxLayout(button_container)
+        button_layout.addStretch()
+        button_layout.addWidget(start_button)
+        button_layout.addStretch()
+        
+        layout.addWidget(button_container)
+        layout.addStretch()
+        
+        self.stacked_widget.addWidget(self.welcome_page)
 
     def init_camera_detection_page(self):
         self.camera_detection_page = QWidget()
         layout = QVBoxLayout(self.camera_detection_page)
+        layout.setContentsMargins(40, 40, 40, 40)
         
+        # Title and description
         title = QLabel("Camera Detection")
+        title.setProperty('title', True)
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        self.status_label = QLabel("Select camera interface:")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.status_label)
+        description = QLabel(
+            "Select your camera interface type below. The software will automatically "
+            "detect and connect to available cameras."
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet(f"""
+            font-size: 14px;
+            color: {self.style_dict['text']};
+            margin: 20px 0;
+        """)
+        description.setAlignment(Qt.AlignCenter)
+        layout.addWidget(description)
 
-        button_layout = QHBoxLayout()
+        # Camera selection group
+        selection_group = QGroupBox("Camera Interface Selection")
+        selection_layout = QVBoxLayout()
+
+        # USB Camera section
+        usb_widget = QWidget()
+        usb_layout = QHBoxLayout(usb_widget)
+        
+        usb_info = QWidget()
+        usb_info_layout = QVBoxLayout(usb_info)
+        usb_title = QLabel("USB3 Camera")
+        usb_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        usb_desc = QLabel("Connect to USB3 Vision compliant cameras")
+        usb_desc.setWordWrap(True)
+        usb_info_layout.addWidget(usb_title)
+        usb_info_layout.addWidget(usb_desc)
         
         self.usb_button = QPushButton("Detect USB Camera")
         self.usb_button.clicked.connect(self.presenter.detect_usb_camera)
-        button_layout.addWidget(self.usb_button)
+        
+        usb_layout.addWidget(usb_info)
+        usb_layout.addWidget(self.usb_button)
+        selection_layout.addWidget(usb_widget)
 
+        # Add separator
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet(f"background-color: {self.style_dict['border']};")
+        selection_layout.addWidget(line)
+
+        # GigE Camera section
+        gige_widget = QWidget()
+        gige_layout = QHBoxLayout(gige_widget)
+        
+        gige_info = QWidget()
+        gige_info_layout = QVBoxLayout(gige_info)
+        gige_title = QLabel("GigE Camera")
+        gige_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        gige_desc = QLabel("Connect to GigE Vision compliant cameras")
+        gige_desc.setWordWrap(True)
+        gige_info_layout.addWidget(gige_title)
+        gige_info_layout.addWidget(gige_desc)
+        
         self.gige_button = QPushButton("Detect GigE Camera")
         self.gige_button.clicked.connect(self.prompt_gige_configuration)
-        button_layout.addWidget(self.gige_button)
+        
+        gige_layout.addWidget(gige_info)
+        gige_layout.addWidget(self.gige_button)
+        selection_layout.addWidget(gige_widget)
 
-        layout.addLayout(button_layout)
+        selection_group.setLayout(selection_layout)
+        layout.addWidget(selection_group)
+        
+        # Status section
+        self.status_label = QLabel("Ready to detect cameras")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet(f"""
+            color: {self.style_dict['text']};
+            font-size: 14px;
+            margin-top: 20px;
+        """)
+        layout.addWidget(self.status_label)
+
+        layout.addStretch()
         self.stacked_widget.addWidget(self.camera_detection_page)
 
     def prompt_gige_configuration(self):
@@ -119,7 +356,8 @@ class CameraTestGUI(QMainWindow):
             ("Live View", lambda: self.stacked_widget.setCurrentWidget(self.live_view_page)),
             ("Feature Tests", self.run_feature_tests),
             ("Image Quality Tests", self.run_image_quality_tests),
-            ("Performance Tests", self.run_performance_tests)
+            ("Performance Tests", self.run_performance_tests),
+            ("Long Run Test", self.run_long_run_test)
         ]
 
         for label, callback in test_buttons:
@@ -128,6 +366,38 @@ class CameraTestGUI(QMainWindow):
             layout.addWidget(btn)
 
         self.stacked_widget.addWidget(self.test_selection_page)
+
+    def init_log_viewer(self):
+        """Initialize the log viewer widget"""
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setMinimumHeight(150)
+        self.log_viewer.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 10pt;
+                border: 1px solid #333333;
+            }
+        """)
+        self.main_layout.addWidget(self.log_viewer)
+
+    def log_message(self, message, level="INFO"):
+        """Add a message to the log viewer"""
+        timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+        color = {
+            "INFO": "#ffffff",
+            "WARNING": "#ffd700",
+            "ERROR": "#ff4444",
+            "DEBUG": "#888888"
+        }.get(level, "#ffffff")
+        
+        formatted_message = f'<div style="color: {color}">[{timestamp}] {level}: {message}</div>'
+        self.log_viewer.append(formatted_message)
+        # Auto-scroll to bottom
+        scrollbar = self.log_viewer.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def display_camera_info(self, info):
         """Display camera information in the GUI"""
@@ -179,6 +449,11 @@ class CameraTestGUI(QMainWindow):
     def run_performance_tests(self):
         """Run performance tests"""
         pass  # TODO: Implement performance tests
+
+    def run_long_run_test(self):
+        """Run long run test"""
+        dialog = LongRunTestDialog(self)
+        dialog.exec_()
 
     def navigate_to_test_selection(self):
         """Navigate to the test selection page"""
@@ -238,6 +513,214 @@ class CameraConfigDialog(QDialog):
                 'subnet_mask': self.subnet_mask.text(),
                 'gateway': self.gateway.text()
             }
+
+class LongRunTestDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Long Run Test")
+        self.setMinimumWidth(800)  # Increased width for live view
+        
+        # Main layout as horizontal to put live view on the right
+        layout = QHBoxLayout(self)
+        
+        # Left side with controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # Duration input
+        duration_group = QGroupBox("Test Duration")
+        duration_layout = QFormLayout()
+        
+        self.hours_input = QSpinBox()
+        self.hours_input.setRange(0, 999)
+        self.minutes_input = QSpinBox()
+        self.minutes_input.setRange(0, 59)
+        
+        duration_layout.addRow("Hours:", self.hours_input)
+        duration_layout.addRow("Minutes:", self.minutes_input)
+        duration_group.setLayout(duration_layout)
+        left_layout.addWidget(duration_group)
+        
+        # Progress section
+        progress_group = QGroupBox("Test Progress")
+        progress_layout = QVBoxLayout()
+        
+        self.progress_bar = QProgressBar()
+        progress_layout.addWidget(self.progress_bar)
+        
+        self.status_label = QLabel("Ready to start")
+        progress_layout.addWidget(self.status_label)
+        
+        self.stats_label = QLabel("")
+        progress_layout.addWidget(self.stats_label)
+        
+        progress_group.setLayout(progress_layout)
+        left_layout.addWidget(progress_group)
+        
+        # Control buttons
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Test")
+        self.start_button.clicked.connect(self.start_test)
+        button_layout.addWidget(self.start_button)
+        
+        self.stop_button = QPushButton("Stop Test")
+        self.stop_button.clicked.connect(self.stop_test)
+        self.stop_button.setEnabled(False)
+        button_layout.addWidget(self.stop_button)
+        
+        left_layout.addLayout(button_layout)
+        
+        # Add left panel to main layout
+        layout.addWidget(left_panel)
+        
+        # Right side with live view
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Live view group
+        view_group = QGroupBox("Live View")
+        view_layout = QVBoxLayout()
+        
+        # Image display
+        self.image_label = QLabel()
+        self.image_label.setMinimumSize(400, 300)
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("QLabel { background-color: #000000; }")
+        view_layout.addWidget(self.image_label)
+        
+        view_group.setLayout(view_layout)
+        right_layout.addWidget(view_group)
+        
+        # Add right panel to main layout
+        layout.addWidget(right_panel)
+        
+        # Set layout ratios (40% controls, 60% live view)
+        layout.setStretch(0, 4)
+        layout.setStretch(1, 6)
+        
+        # Test state
+        self.is_running = False
+        self.test_timer = QTimer()
+        self.test_timer.timeout.connect(self.update_progress)
+        self.start_time = None
+        self.frame_count = 0
+        self.current_fps = 0
+        
+        # Image update timer
+        self.image_timer = QTimer()
+        self.image_timer.timeout.connect(self.update_live_image)
+        self.image_timer.start(33)  # ~30 FPS update rate
+
+    def update_live_image(self):
+        """Update the live image display"""
+        if self.is_running:
+            frame = self.parent.presenter.get_current_frame()
+            if frame is not None:
+                try:
+                    # Convert frame to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Create QImage from frame
+                    h, w, ch = frame_rgb.shape
+                    bytes_per_line = ch * w
+                    qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    
+                    # Scale to fit the label while maintaining aspect ratio
+                    pixmap = QPixmap.fromImage(qt_image)
+                    scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
+                    
+                    # Display the image
+                    self.image_label.setPixmap(scaled_pixmap)
+                except Exception as e:
+                    self.parent.log_message(f"Error updating live image: {str(e)}", "ERROR")
+
+    def closeEvent(self, event):
+        """Handle dialog closure"""
+        if self.is_running:
+            self.stop_test()
+        self.image_timer.stop()
+        event.accept()
+        
+    def start_test(self):
+        total_minutes = self.hours_input.value() * 60 + self.minutes_input.value()
+        if total_minutes <= 0:
+            QMessageBox.warning(self, "Invalid Duration", "Please set a test duration greater than 0 minutes.")
+            return
+            
+        self.total_seconds = total_minutes * 60
+        self.start_time = time.time()
+        self.frame_count = 0
+        self.progress_bar.setRange(0, self.total_seconds)
+        
+        self.is_running = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.hours_input.setEnabled(False)
+        self.minutes_input.setEnabled(False)
+        
+        # Start the camera grabbing in the presenter
+        self.parent.presenter.start_long_run_test()
+        
+        # Start progress update timer
+        self.test_timer.start(1000)  # Update every second
+        
+    def stop_test(self):
+        self.is_running = False
+        self.test_timer.stop()
+        self.parent.presenter.stop_long_run_test()
+        self.reset_ui()
+        
+    def reset_ui(self):
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.hours_input.setEnabled(True)
+        self.minutes_input.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Test stopped")
+        
+    def update_progress(self):
+        if not self.is_running:
+            return
+            
+        elapsed = int(time.time() - self.start_time)
+        self.progress_bar.setValue(elapsed)
+        
+        # Get current stats from presenter
+        stats = self.parent.presenter.get_long_run_stats()
+        self.frame_count = stats.get('frames_captured', 0)
+        self.current_fps = stats.get('current_fps', 0)
+        
+        # Calculate remaining time
+        remaining_seconds = self.total_seconds - elapsed
+        remaining_str = time.strftime('%H:%M:%S', time.gmtime(remaining_seconds))
+        
+        # Format elapsed time
+        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed))
+        
+        # Calculate estimated total frames
+        estimated_total_frames = int(self.current_fps * self.total_seconds)
+        
+        # Update status
+        status_text = (
+            f"Elapsed: {elapsed_str}\n"
+            f"Remaining: {remaining_str}\n"
+            f"Current FPS: {self.current_fps:.1f}\n"
+            f"Frames Captured: {self.frame_count}\n"
+            f"Estimated Total Frames: {estimated_total_frames:,}"
+        )
+        self.stats_label.setText(status_text)
+        
+        # Check if test is complete
+        if elapsed >= self.total_seconds:
+            self.is_running = False
+            self.test_timer.stop()
+            self.parent.presenter.stop_long_run_test()
+            self.reset_ui()
+            QMessageBox.information(self, "Test Complete", 
+                                  f"Long run test completed!\n\n"
+                                  f"Total frames captured: {self.frame_count:,}\n"
+                                  f"Average FPS: {self.frame_count / self.total_seconds:.1f}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
