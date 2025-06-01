@@ -12,90 +12,45 @@ import cv2
 import numpy as np
 from gui.presenter import CameraPresenter
 
-class CameraSelectionDialog(QDialog):
-    def __init__(self, parent=None, cameras=None):
-        super().__init__(parent)
-        self.cameras = cameras or []
-        self.selected_camera = None
-        
-        self.setWindowTitle("Select Camera")
-        self.setMinimumWidth(600)
-        
-        layout = QVBoxLayout(self)
-        
-        # Add description
-        description = QLabel("Multiple cameras found. Please select a camera to proceed:")
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        
-        # Create camera list group
-        list_group = QGroupBox("Available Cameras")
-        list_layout = QVBoxLayout()
-        
-        self.camera_buttons = []
-        for camera in self.cameras:
-            button = QPushButton()
-            button.setCheckable(True)
-            button.setAutoExclusive(True)  # Make buttons behave like radio buttons
-            
-            # Format button text with camera details
-            button_text = (
-                f"{camera.get('name', 'Unknown')}\n"
-                f"Serial Number: {camera.get('id', 'Unknown')}\n"
-                f"Interface: {camera.get('interface', 'Unknown')}"
-            )
-            button.setText(button_text)
-            button.setStyleSheet("""
-                QPushButton {
-                    text-align: left;
-                    padding: 10px;
-                    min-height: 80px;
-                }
-                QPushButton:checked {
-                    background-color: #E3F2FD;
-                    border: 2px solid #1976D2;
-                }
-            """)
-            
-            self.camera_buttons.append(button)
-            list_layout.addWidget(button)
-            
-        list_group.setLayout(list_layout)
-        layout.addWidget(list_group)
-        
-        # Add button box
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept_selection)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        
-    def accept_selection(self):
-        """Handle OK button click"""
-        for button, camera in zip(self.camera_buttons, self.cameras):
-            if button.isChecked():
-                self.selected_camera = camera
-                self.accept()
-                return
-        
-        QMessageBox.warning(self, "Selection Required", "Please select a camera to proceed.")
-        
-    def get_selected_camera(self):
-        """Return the selected camera info"""
-        return self.selected_camera
-
 class CameraTestGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.init_styles()
         self.setup_ui_components()
         self.presenter = CameraPresenter(self)
-        
-        # Initialize image update timer
-        self.live_timer = QTimer()
-        self.live_timer.timeout.connect(self.update_live_view)
-        self.live_timer.setInterval(33)  # ~30 FPS
-        
         self.initUI()
+
+    def setup_ui_components(self):
+        """Initialize UI components that need to be available early"""
+        # Create the log viewer
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setMinimumHeight(150)
+        self.log_viewer.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 10pt;
+                border: 1px solid #333333;
+            }
+        """)
+    
+    def log_message(self, message, level="INFO"):
+        """Add a message to the log viewer"""
+        timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+        color = {
+            "INFO": "#ffffff",
+            "WARNING": "#ffd700",
+            "ERROR": "#ff4444",
+            "DEBUG": "#888888"
+        }.get(level, "#ffffff")
+        
+        formatted_message = f'<div style="color: {color}">[{timestamp}] {level}: {message}</div>'
+        self.log_viewer.append(formatted_message)
+        # Auto-scroll to bottom
+        scrollbar = self.log_viewer.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def init_styles(self):
         """Initialize application-wide styles"""
@@ -168,25 +123,9 @@ class CameraTestGUI(QMainWindow):
             }}
         """)
 
-    def setup_ui_components(self):
-        """Initialize UI components that need to be available early"""
-        # Create the log viewer
-        self.log_viewer = QTextEdit()
-        self.log_viewer.setReadOnly(True)
-        self.log_viewer.setMinimumHeight(150)
-        self.log_viewer.setStyleSheet("""
-            QTextEdit {
-                background-color: #1e1e1e;
-                color: #ffffff;
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 10pt;
-                border: 1px solid #333333;
-            }
-        """)
-
     def initUI(self):
         self.setWindowTitle("GenICam Camera Tester")
-        self.setGeometry(100, 100, 1200, 800)  # Increased default size
+        self.setGeometry(100, 100, 1200, 800)
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -196,7 +135,7 @@ class CameraTestGUI(QMainWindow):
         header = QWidget()
         header_layout = QHBoxLayout(header)
         
-        # Add logo (you can replace this with your actual logo)
+        # Add logo
         logo_label = QLabel("GenICam")
         logo_label.setStyleSheet(f"""
             font-size: 28px;
@@ -220,8 +159,7 @@ class CameraTestGUI(QMainWindow):
         self.stacked_widget = QStackedWidget()
         self.splitter.addWidget(self.stacked_widget)
         
-        # Initialize and add log viewer
-        self.init_log_viewer()
+        # Add log viewer to splitter
         self.splitter.addWidget(self.log_viewer)
         
         # Add splitter to main layout
@@ -237,7 +175,7 @@ class CameraTestGUI(QMainWindow):
         
         # Set initial splitter sizes (70% main content, 30% log)
         self.splitter.setSizes([int(self.height() * 0.7), int(self.height() * 0.3)])
-        
+
     def init_welcome_page(self):
         """Initialize welcome page with software description"""
         self.welcome_page = QWidget()
@@ -386,12 +324,6 @@ class CameraTestGUI(QMainWindow):
         layout.addStretch()
         self.stacked_widget.addWidget(self.camera_detection_page)
 
-    def prompt_gige_configuration(self):
-        config_dialog = CameraConfigDialog(self)
-        if config_dialog.exec_() == QDialog.Accepted:
-            use_dhcp, ip_settings = config_dialog.get_configuration()
-            self.presenter.detect_gige_camera(use_dhcp, ip_settings)
-
     def init_live_view_page(self):
         self.live_view_page = QWidget()
         layout = QVBoxLayout(self.live_view_page)
@@ -514,7 +446,7 @@ class CameraTestGUI(QMainWindow):
         layout.setStretch(1, 1)
         
         self.stacked_widget.addWidget(self.test_selection_page)
-        
+    
     def update_camera_details(self, details):
         """Update the camera details panel with provided information"""
         if not details:
@@ -550,116 +482,63 @@ class CameraTestGUI(QMainWindow):
             self.stacked_widget.setCurrentWidget(self.welcome_page)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Error disconnecting camera: {str(e)}")
+            
+    def run_feature_tests(self):
+        """Run feature access tests"""
+        pass  # TODO: Implement feature tests
+
+    def run_image_quality_tests(self):
+        """Run image quality tests"""
+        pass  # TODO: Implement image quality tests
+
+    def run_performance_tests(self):
+        """Run performance tests"""
+        pass  # TODO: Implement performance tests
+        
+    def run_long_run_test(self):
+        """Run long run test"""
+        dialog = LongRunTestDialog(self)
+        dialog.exec_()
+
+    def toggle_live_view(self):
+        """Toggle live view on/off"""
+        if self.live_button.text() == "Start Live View":
+            self.presenter.start_live_grabbing()
+        else:
+            self.presenter.stop_live_grabbing()
+
+    def snap_image(self):
+        """Capture and save a single image"""
+        pass  # TODO: Implement image capture
+
+    def update_live_image(self, frame):
+        """Update the live view with a new frame"""
+        try:
+            # Convert frame to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Create QImage from frame
+            h, w, ch = frame_rgb.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Scale to fit the label while maintaining aspect ratio
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
+            
+            # Display the image
+            self.image_label.setPixmap(scaled_pixmap)
+        except Exception as e:
+            print(f"Error updating live image: {str(e)}")
+
+    def navigate_to_test_selection(self):
+        """Navigate to the test selection page"""
+        self.stacked_widget.setCurrentWidget(self.test_selection_page)
 
     def closeEvent(self, event):
         """Handle application closure"""
         self.presenter.cleanup()
         event.accept()
-
-    def init_log_viewer(self):
-        """Initialize the log viewer component with Basler-themed styling"""
-        log_container = QWidget()
-        log_layout = QVBoxLayout(log_container)
-        
-        # Add header to log viewer
-        log_header = QLabel("System Log")
-        log_header.setStyleSheet(f"""
-            font-size: 14px;
-            font-weight: bold;
-            color: {self.style_dict['primary']};
-            padding: 4px;
-        """)
-        log_layout.addWidget(log_header)
-        
-        # Create log text area
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(150)
-        self.log_text.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: {self.style_dict['white']};
-                border: 1px solid {self.style_dict['border']};
-                border-radius: 4px;
-                padding: 8px;
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 12px;
-            }}
-        """)
-        log_layout.addWidget(self.log_text)
-        
-        self.log_viewer = log_container
-
-    def run_feature_tests(self):
-        """Run feature access tests"""
-        self.presenter.run_feature_tests()
-
-    def run_image_quality_tests(self):
-        """Run image quality tests"""
-        self.presenter.run_image_quality_tests()
-
-    def run_performance_tests(self):
-        """Run performance tests"""
-        self.presenter.run_performance_tests()
-
-    def run_long_run_test(self):
-        """Show long run test dialog"""
-        dialog = LongRunTestDialog(self)
-        dialog.exec_()
-
-    def update_live_view(self):
-        """Update the live view with the current frame"""
-        frame = self.presenter.get_current_frame()
-        if frame is not None:
-            try:
-                # Convert frame to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Create QImage from frame
-                h, w, ch = frame_rgb.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                
-                # Scale to fit the label while maintaining aspect ratio
-                pixmap = QPixmap.fromImage(qt_image)
-                scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
-                
-                # Display the image
-                self.image_label.setPixmap(scaled_pixmap)
-            except Exception as e:
-                self.log_message(f"Error updating live image: {str(e)}", "ERROR")
-
-    def toggle_live_view(self):
-        """Toggle live view on/off"""
-        if self.live_button.text() == "Start Live View":
-            if self.presenter.start_live_view():
-                self.live_button.setText("Stop Live View")
-                self.live_timer.start()
-        else:
-            self.presenter.stop_live_view()
-            self.live_button.setText("Start Live View")
-            self.live_timer.stop()
-            self.image_label.clear()
-
-    def snap_image(self):
-        """Capture a single image"""
-        self.presenter.snap_image()
-
-    def log_message(self, message, level="INFO"):
-        """Add a message to the log viewer"""
-        timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
-        color = {
-            "INFO": "black",
-            "WARNING": "#FFA500",
-            "ERROR": "red",
-            "SUCCESS": "green"
-        }.get(level.upper(), "black")
-        
-        html_message = f'<p style="margin: 0;"><span style="color: #666;">{timestamp}</span> <span style="color: {color};">[{level}]</span> {message}</p>'
-        self.log_text.append(html_message)
-        # Auto scroll to bottom
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
 
 class CameraConfigDialog(QDialog):
     def __init__(self, parent=None):
@@ -919,8 +798,73 @@ class LongRunTestDialog(QDialog):
                                   f"Total frames captured: {self.frame_count:,}\n"
                                   f"Average FPS: {self.frame_count / self.total_seconds:.1f}")
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    gui = CameraTestGUI()
-    gui.show()
-    sys.exit(app.exec_())
+class CameraSelectionDialog(QDialog):
+    def __init__(self, parent=None, cameras=None):
+        super().__init__(parent)
+        self.cameras = cameras or []
+        self.selected_camera = None
+        
+        self.setWindowTitle("Select Camera")
+        self.setMinimumWidth(600)
+        
+        layout = QVBoxLayout(self)
+        
+        # Add description
+        description = QLabel("Multiple cameras found. Please select a camera to proceed:")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        
+        # Create camera list group
+        list_group = QGroupBox("Available Cameras")
+        list_layout = QVBoxLayout()
+        
+        self.camera_buttons = []
+        for camera in self.cameras:
+            button = QPushButton()
+            button.setCheckable(True)
+            button.setAutoExclusive(True)  # Make buttons behave like radio buttons
+            
+            # Format button text with camera details
+            button_text = (
+                f"{camera['name']}\n"
+                f"Serial Number: {camera['id']}\n"
+                f"Interface: {camera['interface']}"
+            )
+            button.setText(button_text)
+            button.setStyleSheet("""
+                QPushButton {
+                    text-align: left;
+                    padding: 10px;
+                    min-height: 80px;
+                }
+                QPushButton:checked {
+                    background-color: #E3F2FD;
+                    border: 2px solid #1976D2;
+                }
+            """)
+            
+            self.camera_buttons.append(button)
+            list_layout.addWidget(button)
+            
+        list_group.setLayout(list_layout)
+        layout.addWidget(list_group)
+        
+        # Add button box
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept_selection)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+    def accept_selection(self):
+        """Handle OK button click"""
+        for button, camera in zip(self.camera_buttons, self.cameras):
+            if button.isChecked():
+                self.selected_camera = camera
+                self.accept()
+                return
+        
+        QMessageBox.warning(self, "Selection Required", "Please select a camera to proceed.")
+        
+    def get_selected_camera(self):
+        """Return the selected camera info"""
+        return self.selected_camera

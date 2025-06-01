@@ -3,12 +3,13 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QMessageBox, QDialog
 from PyQt5.QtCore import QTimer
 from pypylon import pylon
 import cv2
 import numpy as np
 import time
+import logging
 
 class CameraPresenter:
     def __init__(self, view):
@@ -24,15 +25,18 @@ class CameraPresenter:
         self.long_run_frame_count = 0
         self.long_run_last_fps_update = None
         self.long_run_last_frame_count = 0
+        self.current_fps = 0
+        self.frame_count = 0
+        self.test_start_time = None
+        self._last_frame_log_time = 0
+        self._frames_since_last_log = 0
         self._init_logging()
 
     def _init_logging(self):
         """Initialize logging for the presenter"""
-        import logging
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
         
-        # Add console handler if not already added
         if not self.logger.handlers:
             console_handler = logging.StreamHandler()
             console_handler.setLevel(logging.DEBUG)
@@ -60,209 +64,438 @@ class CameraPresenter:
         setattr(self, name, test)
         self.logger.debug(f"Added test: {name}")
 
-    def detect_usb_camera(self):
+    def start_live_view(self):
+        """Start live view of the camera with enhanced error checking"""
         try:
-            self.logger.info("Detecting USB cameras...")
-            cameras = self.camera_helper.enumerate_cameras()
-            self.logger.debug(f"Found cameras: {cameras}")
+            if not self.camera:
+                error_msg = "Cannot start live view: No camera connected"
+                self.logger.error(error_msg)
+                self.view.log_message(error_msg, "ERROR")
+                return False
+                
+            if not self.camera.IsOpen():
+                error_msg = "Cannot start live view: Camera is not open"
+                self.logger.error(error_msg)
+                self.view.log_message(error_msg, "ERROR")
+                return False
+
+            # Configure camera for continuous acquisition
+            try:
+                if hasattr(self.camera, 'AcquisitionMode'):
+                    self.camera.AcquisitionMode.SetValue('Continuous')
+                    self.logger.debug("Set acquisition mode to Continuous")
+            except Exception as e:
+                self.logger.warning(f"Could not set acquisition mode: {str(e)}")
+                
+            # Configure frame rate if available
+            try:
+                if hasattr(self.camera, 'AcquisitionFrameRateEnable'):
+                    self.camera.AcquisitionFrameRateEnable.SetValue(True)
+                    if hasattr(self.camera, 'AcquisitionFrameRate'):
+                        current_rate = self.camera.AcquisitionFrameRate.GetValue()
+                        self.logger.debug(f"Current frame rate: {current_rate} fps")
+            except Exception as e:
+                self.logger.warning(f"Could not configure frame rate: {str(e)}")
+                
+            # Start grabbing
+            if self.camera.IsGrabbing():
+                self.logger.debug("Camera was already grabbing, stopping first")
+                self.camera.StopGrabbing()
+                
+            self.logger.debug("Starting camera grabbing")
+            self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
             
-            # Look for any USB-related interface types
-            usb_cameras = [cam for cam in cameras 
-                         if any(usb_type in cam['interface'].lower() 
-                               for usb_type in ['usb', 'baslerusb', 'genapi'])]
-            self.logger.debug(f"Found USB cameras: {usb_cameras}")
+            # Verify grabbing started successfully
+            if not self.camera.IsGrabbing():
+                error_msg = "Failed to start camera grabbing"
+                self.logger.error(error_msg)
+                self.view.log_message(error_msg, "ERROR")
+                return False
+                
+            # Reset frame counting
+            self._frames_since_last_log = 0
+            self._last_frame_log_time = time.time()
+                
+            # Test first frame grab
+            test_frame = self.camera_helper.get_frame(self.camera)
+            if test_frame is None:
+                error_msg = "Camera started but could not grab test frame"
+                self.logger.error(error_msg)
+                self.view.log_message(error_msg, "ERROR")
+                if self.camera.IsGrabbing():
+                    self.camera.StopGrabbing()
+                return False
+                
+            self.is_live_grabbing = True
+            self.logger.info("Live view started successfully")
+            self.view.log_message("Live view started", "SUCCESS")
+            return True
             
-            if not usb_cameras:
-                self.logger.warning("No USB cameras found")
-                QMessageBox.warning(self.view, "USB Camera Detection", "No USB cameras found.")
+        except Exception as e:
+            error_msg = f"Error starting live view: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.log_message(error_msg, "ERROR")
+            self.is_live_grabbing = False
+            if self.camera and self.camera.IsGrabbing():
+                try:
+                    self.camera.StopGrabbing()
+                except:
+                    pass
+            return False
+
+    def stop_live_view(self):
+        """Stop live view"""
+        try:
+            if self.camera and self.camera.IsGrabbing():
+                self.logger.debug(f"Stopping camera grabbing. Frames since last log: {self._frames_since_last_log}")
+                self.camera.StopGrabbing()
+                
+            self.is_live_grabbing = False
+            self.logger.info("Live view stopped")
+            self.view.log_message("Live view stopped", "INFO")
+            
+        except Exception as e:
+            error_msg = f"Error stopping live view: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.log_message(error_msg, "ERROR")
+
+    def get_current_frame(self):
+        """Get the current frame with enhanced error checking"""
+        if not self.camera:
+            self.logger.error("Cannot get frame: No camera connected")
+            return None
+            
+        if not self.is_live_grabbing and not self.is_long_run_test:
+            self.logger.error("Cannot get frame: Camera is not grabbing")
+            return None
+            
+        try:
+            frame = self.camera_helper.get_frame(self.camera)
+            if frame is not None:
+                self._frames_since_last_log += 1
+                
+                if self.is_long_run_test:
+                    self.long_run_frame_count += 1
+                    
+                # Log frame statistics periodically
+                current_time = time.time()
+                if current_time - self._last_frame_log_time >= 5.0:  # Log every 5 seconds
+                    fps = self._frames_since_last_log / (current_time - self._last_frame_log_time)
+                    self.logger.debug(
+                        f"Frames grabbed: {self._frames_since_last_log}, "
+                        f"FPS: {fps:.1f}, Shape: {frame.shape}"
+                    )
+                    self._frames_since_last_log = 0
+                    self._last_frame_log_time = current_time
+                    
+                return frame
+            else:
+                error_msg = "Failed to get frame from camera"
+                self.logger.error(error_msg)
+                if self.is_long_run_test:
+                    self.view.log_message(error_msg, "ERROR")
+                return None
+                
+        except Exception as e:
+            error_msg = f"Error getting frame: {str(e)}"
+            self.logger.error(error_msg)
+            if self.is_long_run_test:
+                self.view.log_message(error_msg, "ERROR")
+            return None
+
+    def detect_usb_camera(self):
+        """Detect and connect to a USB camera"""
+        try:
+            self.logger.info("Starting USB camera discovery...")
+            if self.camera_helper is None:
+                raise RuntimeError("Camera helper not initialized")
+                
+            # Get list of available cameras
+            cameras = self.camera_helper.get_usb_cameras()
+            if not cameras:
+                self.view.log_message("No USB cameras found", "WARNING")
                 return
+                
+            selected_camera = None
+            if len(cameras) == 1:
+                selected_camera = cameras[0]
+            else:
+                from gui.main_gui import CameraSelectionDialog
+                dialog = CameraSelectionDialog(self.view, cameras)
+                if dialog.exec_() == QDialog.Accepted:
+                    selected_camera = dialog.get_selected_camera()
             
-            # Connect to the first USB camera
-            self.logger.info(f"Connecting to USB camera: {usb_cameras[0]['id']}")
-            self.camera_helper.connect_camera(usb_cameras[0]['id'])
-            camera_info = (
-                f"Camera detected:\nSerial Number: {usb_cameras[0]['id']}\n"
-                f"Model: {usb_cameras[0]['name']}\n"
-                f"Interface: {usb_cameras[0]['interface']}\n"
-                f"Full Name: {usb_cameras[0].get('full_name', 'N/A')}"
-            )
-            self.view.display_camera_info(camera_info)
-            self.view.navigate_to_test_selection()
+            if selected_camera:
+                # Connect to the selected camera
+                self.camera = self.camera_helper.connect_camera(selected_camera)
+                if self.camera:
+                    self.view.log_message(
+                        f"Successfully connected to camera: {selected_camera.get('name', 'Unknown')} "
+                        f"(SN: {selected_camera.get('id', 'Unknown')})",
+                        "SUCCESS"
+                    )
+                    # Update camera details
+                    self.update_camera_details(selected_camera)
+                    # Switch to test selection page
+                    self.view.stacked_widget.setCurrentWidget(self.view.test_selection_page)
+                else:
+                    self.view.log_message("Failed to connect to camera", "ERROR")
             
         except Exception as e:
             self.logger.error(f"USB camera detection error: {str(e)}")
-            QMessageBox.critical(self.view, "Error", f"Failed to connect to USB camera: {str(e)}")
+            self.view.log_message(f"Error detecting USB camera: {str(e)}", "ERROR")
 
-    def detect_gige_camera(self, use_dhcp=True, ip_settings=None):
+    def update_camera_details(self, camera_info):
+        """Update camera details in the GUI with enhanced error handling"""
         try:
-            self.logger.info("Detecting GigE cameras...")
-            cameras = self.camera_helper.enumerate_cameras()
-            self.logger.debug(f"Found cameras: {cameras}")
-            
-            gige_cameras = [cam for cam in cameras if 'GigE' in cam['interface']]
-            self.logger.debug(f"Found GigE cameras: {gige_cameras}")
-            
-            if not gige_cameras:
-                self.logger.warning("No GigE cameras found")
-                QMessageBox.warning(self.view, "GigE Camera Detection", "No GigE cameras found.")
-                return
-            
-            # Connect to the first GigE camera
-            self.logger.info(f"Connecting to GigE camera: {gige_cameras[0]['id']}")
-            self.camera_helper.connect_camera(gige_cameras[0]['id'])
-            camera_info = (
-                f"Camera detected:\nSerial Number: {gige_cameras[0]['id']}\n"
-                f"Model: {gige_cameras[0]['name']}\n"
-                f"Interface: {gige_cameras[0]['interface']}\n"
-                f"IP Address: {gige_cameras[0].get('ip_address', 'N/A')}\n"
-                f"Full Name: {gige_cameras[0].get('full_name', 'N/A')}"
-            )
-            self.view.display_camera_info(camera_info)
-            self.view.navigate_to_test_selection()
-            
-        except Exception as e:
-            self.logger.error(f"GigE camera detection error: {str(e)}")
-            QMessageBox.critical(self.view, "Error", f"Failed to connect to GigE camera: {str(e)}")
+            details = {
+                'name': camera_info.get('name', 'Unknown'),
+                'manufacturer': 'Basler',
+                'serial_number': camera_info.get('id', 'Unknown'),
+                'interface': camera_info.get('interface', 'Unknown'),
+                'firmware_version': 'N/A',
+                'sensor_type': 'N/A',
+                'sensor_size': 'N/A',
+                'pixel_size': 'N/A',
+            }
 
-    def start_live_grabbing(self):
-        """Start live image grabbing"""
-        try:
-            if not self.is_live_grabbing:
-                self.logger.info("Starting live grabbing")
-                if not self.camera_helper:
-                    raise RuntimeError("Camera helper not initialized")
-                self.camera_helper.start_grabbing()
-                self.is_live_grabbing = True
-                
-                # Create timer for live view updates
-                self.live_timer = QTimer()
-                self.live_timer.timeout.connect(self.update_live_view)
-                self.live_timer.start(33)  # ~30 FPS
-                
-                self.view.update_live_button_state(True)
-        except Exception as e:
-            self.logger.error(f"Failed to start live grabbing: {str(e)}")
-            QMessageBox.critical(self.view, "Error", f"Failed to start live grabbing: {str(e)}")
-            self.stop_live_grabbing()
+            if self.camera:
+                try:
+                    if hasattr(self.camera, 'DeviceFirmwareVersion'):
+                        details['firmware_version'] = self.camera.DeviceFirmwareVersion.GetValue()
+                except Exception as e:
+                    self.logger.warning(f"Could not get firmware version: {str(e)}")
 
-    def stop_live_grabbing(self):
-        """Stop live image grabbing"""
-        try:
-            if self.is_live_grabbing:
-                self.logger.info("Stopping live grabbing")
-                if self.live_timer:
-                    self.live_timer.stop()
-                    self.live_timer = None
-                
-                if self.camera_helper:
-                    self.camera_helper.stop_grabbing()
-                self.is_live_grabbing = False
-                self.view.update_live_button_state(False)
-        except Exception as e:
-            self.logger.error(f"Failed to stop live grabbing: {str(e)}")
-            QMessageBox.critical(self.view, "Error", f"Failed to stop live grabbing: {str(e)}")
+                try:
+                    if hasattr(self.camera, 'SensorType'):
+                        details['sensor_type'] = self.camera.SensorType.GetValue()
+                except Exception as e:
+                    self.logger.warning(f"Could not get sensor type: {str(e)}")
 
-    def update_live_view(self):
-        """Update the live view with the latest frame"""
-        try:
-            if self.is_live_grabbing and self.camera_helper:
-                frame = self.camera_helper.get_frame()
-                if frame is not None:
-                    self.view.update_live_image(frame)
+                try:
+                    if hasattr(self.camera, 'SensorWidth') and hasattr(self.camera, 'SensorHeight'):
+                        width = self.camera.SensorWidth.GetValue()
+                        height = self.camera.SensorHeight.GetValue()
+                        details['sensor_size'] = f"{width}x{height}"
+                except Exception as e:
+                    self.logger.warning(f"Could not get sensor size: {str(e)}")
+
+                try:
+                    if hasattr(self.camera, 'PixelSize'):
+                        pixel_size = self.camera.PixelSize.GetValue()
+                        details['pixel_size'] = f"{pixel_size} µm"
+                except Exception as e:
+                    self.logger.warning(f"Could not get pixel size: {str(e)}")
+
+            # Add documentation link
+            model = camera_info.get('name', '').lower()
+            details['documentation_link'] = f"https://docs.baslerweb.com/{model}"
+
+            self.view.update_camera_details(details)
+            self.logger.info("Camera details updated successfully")
+
         except Exception as e:
-            self.logger.error(f"Error updating live view: {str(e)}")
-            self.stop_live_grabbing()
+            self.logger.error(f"Error updating camera details: {str(e)}")
+            # Still try to show basic info
+            self.view.update_camera_details(camera_info)
+
+    def cleanup(self):
+        """Clean up resources before closing"""
+        try:
+            if self.camera:
+                if self.is_live_grabbing:
+                    self.stop_live_view()
+                if hasattr(self.camera, 'IsGrabbing') and self.camera.IsGrabbing():
+                    self.camera.StopGrabbing()
+                if hasattr(self.camera, 'Close') and self.camera.IsOpen():
+                    self.camera.Close()
+                self.camera = None
+            self.logger.info("Cleaning up resources")
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}")
+
+    def disconnect_camera(self):
+        """Disconnect the current camera"""
+        try:
+            if self.camera:
+                if self.is_live_grabbing:
+                    self.stop_live_view()
+                if self.camera.IsGrabbing():
+                    self.camera.StopGrabbing()
+                if self.camera.IsOpen():
+                    self.camera.Close()
+                self.camera = None
+                self.logger.info("Camera disconnected successfully")
+                return True
+        except Exception as e:
+            self.logger.error(f"Error disconnecting camera: {str(e)}")
+        return False
 
     def start_long_run_test(self):
-        """Start long run test with live frame grabbing"""
+        """Start long run test with enhanced error handling"""
+        if not self.camera:
+            self.view.log_message("No camera connected", "ERROR")
+            return False
+
         try:
-            self.logger.info("Starting long run test")
-            self.view.log_message("Starting long run test")
+            if self.is_live_grabbing:
+                self.stop_live_view()
+
+            # Configure camera for continuous acquisition
+            if hasattr(self.camera, 'AcquisitionMode'):
+                self.camera.AcquisitionMode.SetValue('Continuous')
+                self.logger.debug("Set acquisition mode to Continuous")
+                
+            # Configure frame rate if available
+            if hasattr(self.camera, 'AcquisitionFrameRateEnable'):
+                self.camera.AcquisitionFrameRateEnable.SetValue(True)
+                if hasattr(self.camera, 'AcquisitionFrameRate'):
+                    max_frame_rate = self.camera.AcquisitionFrameRate.GetMax()
+                    self.camera.AcquisitionFrameRate.SetValue(max_frame_rate)
+                    actual_frame_rate = self.camera.AcquisitionFrameRate.GetValue()
+                    self.logger.info(f"Set frame rate to {actual_frame_rate:.1f} fps")
+
+            # Start grabbing
+            if self.camera.IsGrabbing():
+                self.logger.debug("Camera was already grabbing, stopping first")
+                self.camera.StopGrabbing()
+                
+            self.logger.debug("Starting camera grabbing for long run test")
+            self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            
+            # Verify grabbing started successfully
+            if not self.camera.IsGrabbing():
+                raise RuntimeError("Failed to start camera grabbing")
+                
+            # Try to get first frame to verify everything is working
+            test_frame = self.camera_helper.get_frame(self.camera)
+            if test_frame is None:
+                raise RuntimeError("Failed to retrieve test frame")
+
             self.is_long_run_test = True
             self.long_run_start_time = time.time()
             self.long_run_frame_count = 0
             self.long_run_last_fps_update = time.time()
             self.long_run_last_frame_count = 0
-            
-            # Start grabbing if not already grabbing
-            if self.camera_helper and not self.camera_helper.camera.IsGrabbing():
-                self.camera_helper.start_grabbing()
-                
+            self._frames_since_last_log = 0
+            self._last_frame_log_time = time.time()
+
+            self.logger.info("Long run test started successfully")
+            self.view.log_message("Long run test started successfully", "SUCCESS")
+            return True
         except Exception as e:
-            self.logger.error(f"Error starting long run test: {str(e)}")
-            self.view.log_message(f"Error starting long run test: {str(e)}", "ERROR")
-            
-    def stop_long_run_test(self):
-        """Stop long run test"""
-        try:
-            self.logger.info("Stopping long run test")
-            self.view.log_message("Long run test stopped")
+            error_msg = f"Error starting long run test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.log_message(error_msg, "ERROR")
             self.is_long_run_test = False
-            if self.camera_helper:
-                self.camera_helper.stop_grabbing()
+            if self.camera and self.camera.IsGrabbing():
+                try:
+                    self.camera.StopGrabbing()
+                except:
+                    pass
+            return False
+
+    def stop_long_run_test(self):
+        """Stop long run test with statistics logging"""
+        self.logger.info("Stopping long run test")
+        try:
+            if not self.is_long_run_test:
+                return
+
+            if self.camera and self.camera.IsGrabbing():
+                self.camera.StopGrabbing()
                 
-            # Log final statistics
-            stats = self.get_long_run_stats()
-            self.view.log_message(
-                f"Test completed - Total frames: {stats['frames_captured']:,}, "
-                f"Average FPS: {stats['average_fps']:.1f}")
+            # Calculate final statistics
+            total_time = time.time() - self.long_run_start_time
+            avg_fps = self.long_run_frame_count / total_time if total_time > 0 else 0
+            
+            stats_msg = (
+                f"Long run test completed:\n"
+                f"Total frames: {self.long_run_frame_count:,}\n"
+                f"Test duration: {total_time:.1f} seconds\n"
+                f"Average FPS: {avg_fps:.1f}"
+            )
+            
+            self.logger.info(stats_msg)
+            self.view.log_message(stats_msg, "SUCCESS")
+            
+        except Exception as e:
+            error_msg = f"Error stopping long run test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.log_message(error_msg, "ERROR")
+        finally:
+            self.is_long_run_test = False
+            self._frames_since_last_log = 0
+            
+    def get_current_frame(self):
+        """Get the current frame with enhanced error checking and reduced logging"""
+        if not self.camera:
+            return None
+            
+        if not self.is_live_grabbing and not self.is_long_run_test:
+            return None
+            
+        try:
+            frame = self.camera_helper.get_frame(self.camera)
+            if frame is not None:
+                self._frames_since_last_log += 1
+                
+                if self.is_long_run_test:
+                    self.long_run_frame_count += 1
+                    
+                # Log frame statistics periodically (every 5 seconds)
+                current_time = time.time()
+                if current_time - self._last_frame_log_time >= 5.0:
+                    fps = self._frames_since_last_log / (current_time - self._last_frame_log_time)
+                    self.logger.debug(
+                        f"Frame stats: Count={self._frames_since_last_log}, "
+                        f"FPS={fps:.1f}, Shape={frame.shape}"
+                    )
+                    self._frames_since_last_log = 0
+                    self._last_frame_log_time = current_time
+                    
+                return frame
+            else:
+                # Only log error once per second to avoid spam
+                current_time = time.time()
+                if not hasattr(self, '_last_error_log_time') or current_time - self._last_error_log_time >= 1.0:
+                    self.logger.error("Failed to get frame from camera")
+                    self._last_error_log_time = current_time
+                return None
                 
         except Exception as e:
-            self.logger.error(f"Error stopping long run test: {str(e)}")
-            self.view.log_message(f"Error stopping long run test: {str(e)}", "ERROR")
-            
+            # Only log error once per second
+            current_time = time.time()
+            if not hasattr(self, '_last_error_log_time') or current_time - self._last_error_log_time >= 1.0:
+                self.logger.error(f"Error getting frame: {str(e)}")
+                self._last_error_log_time = current_time
+            return None
+
     def get_long_run_stats(self):
         """Get current statistics for long run test"""
-        try:
-            current_time = time.time()
-            elapsed = current_time - self.long_run_start_time
-            
-            # Calculate current FPS over the last second
-            frames_since_last = self.long_run_frame_count - self.long_run_last_frame_count
-            time_since_last = current_time - self.long_run_last_fps_update
-            current_fps = frames_since_last / time_since_last if time_since_last > 0 else 0
-            
-            # Calculate average FPS
-            average_fps = self.long_run_frame_count / elapsed if elapsed > 0 else 0
-            
-            # Update last values
-            self.long_run_last_fps_update = current_time
-            self.long_run_last_frame_count = self.long_run_frame_count
-            
-            # Log progress every minute
-            if int(elapsed) % 60 == 0:
-                self.view.log_message(
-                    f"Long run test progress - Frames: {self.long_run_frame_count:,}, "
-                    f"Current FPS: {current_fps:.1f}")
-            
+        if not self.is_long_run_test:
             return {
-                "elapsed_time": elapsed,
-                "frames_captured": self.long_run_frame_count,
-                "current_fps": current_fps,
-                "average_fps": average_fps
+                'frames_captured': 0,
+                'current_fps': 0,
+                'elapsed_time': 0,
+                'errors': 0
             }
-        except Exception as e:
-            self.logger.error(f"Error getting long run stats: {str(e)}")
-            return {}
-
-    def get_current_frame(self):
-        """Get the current frame from the camera"""
-        try:
-            if self.camera_helper and self.camera_helper.camera:
-                frame = self.camera_helper.get_frame(increment_count=self.is_long_run_test)
-                if frame is not None:
-                    # If this is part of a long run test, increment the frame counter
-                    if self.is_long_run_test:
-                        self.long_run_frame_count += 1
-                return frame
-            return None
-        except Exception as e:
-            self.logger.error(f"Error getting current frame: {str(e)}")
-            return None
-
-    def cleanup(self):
-        """Clean up resources"""
-        self.logger.info("Cleaning up resources")
-        self.stop_live_grabbing()
-        if self.camera_helper:
-            self.camera_helper.disconnect_camera()
+        
+        current_time = time.time()
+        elapsed_time = current_time - self.long_run_start_time if self.long_run_start_time else 0
+        
+        # Calculate current FPS based on frames since last update
+        frames_since_last = self.long_run_frame_count - self.long_run_last_frame_count
+        time_since_last = current_time - self.long_run_last_fps_update
+        current_fps = frames_since_last / time_since_last if time_since_last > 0 else 0
+        
+        # Update last values for next calculation
+        self.long_run_last_frame_count = self.long_run_frame_count
+        self.long_run_last_fps_update = current_time
+        
+        return {
+            'frames_captured': self.long_run_frame_count,
+            'current_fps': current_fps,
+            'elapsed_time': elapsed_time,
+            'errors': 0  # TODO: Implement error tracking if needed
+        }
