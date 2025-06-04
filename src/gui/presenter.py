@@ -499,3 +499,122 @@ class CameraPresenter:
             'elapsed_time': elapsed_time,
             'errors': 0  # TODO: Implement error tracking if needed
         }
+    
+    def run_feature_tests(self):
+        """Run camera feature access tests"""
+        try:
+            from tests.test_featureAccess import TestFeatureAccess
+            
+            self.logger.info("Starting feature access tests")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = TestFeatureAccess()
+            test.setup(self.camera_helper)
+            
+            # Run tests and get results
+            try:
+                results = test.test_basic_features()
+                
+                # Log detailed results
+                self.logger.info("Feature test results:")
+                for feature, details in results["readability_test"].items():
+                    if details['readable']:
+                        self.logger.info(f"{feature}: Read successful, value: {details['value']}")
+                    else:
+                        self.logger.warning(f"{feature}: Read failed - {details['error']}")
+                
+                for feature, result in results["write_test"].items():
+                    if isinstance(result, dict):
+                        if 'success' in result:
+                            success = result['success']
+                            error = result.get('error', 'Unknown error')
+                            self.logger.info(f"{feature}: Write {'successful' if success else f'failed - {error}'}")
+                        else:
+                            # Handle test result dictionaries that contain sub-results
+                            self.logger.info(f"{feature} test results:")
+                            for subtest, value in result.items():
+                                if value is None:
+                                    self.logger.info(f"  - {subtest}: Not Supported")
+                                elif isinstance(value, bool):
+                                    self.logger.info(f"  - {subtest}: {'successful' if value else 'failed'}")
+                                else:
+                                    self.logger.info(f"  - {subtest}: {value}")
+                    elif isinstance(result, bool):
+                        self.logger.info(f"{feature}: Write {'successful' if result else 'failed'}")
+                    elif result is None:
+                        self.logger.info(f"{feature}: Not Supported")
+                    else:
+                        self.logger.warning(f"{feature}: Invalid result type - {type(result)}")
+                
+                # Update view with results
+                summary = self._format_test_results(results)
+                self.view.update_test_results("Feature Tests", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Feature test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+                
+            finally:
+                # Always try to restore original settings
+                try:
+                    test.restore_original_settings()
+                except Exception as e:
+                    self.logger.error(f"Failed to restore camera settings: {str(e)}")
+        except Exception as e:
+            error_msg = f"Failed to initialize feature tests: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def _format_test_results(self, results):
+        """Format test results into a readable summary with improved formatting"""
+        summary = []
+        
+        # Add header with timestamp
+        summary.append("=== Feature Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        # Add readability test results
+        summary.append("=== Readability Tests ===")
+        summary.append("-" * 80)
+        summary.append(f"{'Status':<8}{'Feature':<32}{'Value/Error'}")
+        summary.append("-" * 80)
+        for feature, details in results["readability_test"].items():
+            status = "✓" if details['readable'] else "✗"
+            value = details['value'] if details['readable'] else details['error']
+            summary.append(f"{status:<8}{feature:<32}{value}")
+        
+        # Add write test results
+        summary.append("\n=== Write Tests ===")
+        summary.append("-" * 80)
+        summary.append(f"{'Status':<8}{'Feature':<32}{'Error (if any)'}")
+        summary.append("-" * 80)
+        for feature, result in results["write_test"].items():
+            if isinstance(result, dict):
+                status = "✓" if result.get('success', False) else "✗"
+                error = f" - {result['error']}" if not result.get('success', False) else ""
+            else:
+                status = "✓" if result else "✗"
+                error = ""
+            summary.append(f"{status:<8}{feature:<32}{error}")
+        
+        # Add summary footer
+        summary.append("\n=== Test Summary ===")
+        read_success = sum(1 for _, d in results["readability_test"].items() if d['readable'])
+        read_total = len(results["readability_test"])
+        write_success = sum(1 for _, r in results["write_test"].items() if r.get('success', r) if r)
+        write_total = len(results["write_test"])
+        
+        summary.append(f"Read Tests:  {read_success}/{read_total} successful")
+        summary.append(f"Write Tests: {write_success}/{write_total} successful")
+        summary.append(f"Overall:     {read_success + write_success}/{read_total + write_total} successful")
+        
+        return "\n".join(summary)
