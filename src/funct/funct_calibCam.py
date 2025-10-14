@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import pytest
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from lib.camera_helper import CameraHelper
@@ -26,7 +25,11 @@ class CameraCalibration:
         objp[:, :2] = np.mgrid[0:self.checkerboard[0], 0:self.checkerboard[1]].T.reshape(-1, 2)
 
         for img in images:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # Support grayscale frames directly
+            if len(img.shape) == 2 or (len(img.shape) == 3 and img.shape[2] == 1):
+                gray = img
+            else:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             ret, corners = cv2.findChessboardCorners(gray, self.checkerboard, None)
             
             if ret:
@@ -56,26 +59,4 @@ class CameraCalibration:
             raise RuntimeError("Camera not calibrated yet")
         return cv2.undistort(img, self.camera_matrix, self.dist_coeffs)
 
-# Test fixtures and functions for pytest
-@pytest.fixture(scope='module')
-def camera():
-    camera_helper = CameraHelper()
-    camera_helper.connect_camera(ip_address="192.168.1.10")
-    yield camera_helper
-    camera_helper.disconnect_camera()
-
-def test_camera_calibration(camera):
-    calibrator = CameraCalibration()
-    calibrator.set_camera(camera)
-    
-    # Capture some calibration images
-    images = [calibrator.capture_calibration_image() for _ in range(5)]
-    
-    # Perform calibration
-    success = calibrator.calibrate_camera(images)
-    assert success, "Camera calibration failed"
-    
-    # Test undistortion
-    test_image = calibrator.capture_calibration_image()
-    undistorted = calibrator.undistort_image(test_image)
-    assert undistorted is not None, "Image undistortion failed"
+# Embedded standalone tests removed; see tests in src/tests

@@ -12,9 +12,10 @@ from PyQt5.QtWidgets import (
     QWidget,
     QMessageBox,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from pypylon import pylon
+from lib.camera_helper import CameraHelper
 
 
 class CameraTester(QMainWindow):
@@ -23,8 +24,16 @@ class CameraTester(QMainWindow):
         self.setWindowTitle("GenICam Camera Tester")
         self.setGeometry(100, 100, 1200, 800)
 
-        # Initialize Widgets
+        # Initialize CameraHelper
+        self.camera_helper = CameraHelper()
         self.camera = None
+
+        # Health check timer
+        self.health_timer = QTimer()
+        self.health_timer.timeout.connect(self.check_health)
+        self.health_timer.start(2000)  # Check every 2 seconds
+
+        # Initialize Widgets
         self.device_info_label = QLabel("Camera Information:\nNo camera connected.")
         self.live_view_label = QLabel("Live View")
         self.image_info_label = QLabel("Image Information:\nNo image captured yet.")
@@ -96,31 +105,38 @@ class CameraTester(QMainWindow):
         """Log messages to the test log."""
         self.test_log.append(message)
 
+    def check_health(self):
+        health = self.camera_helper.health_check()
+        if health['status'] != 'ok':
+            self.log_message(f"[HEALTH WARNING] Camera health status: {health['status']}")
+
     def start_camera(self):
-        """Start and connect to the GenICam camera."""
+        """Start and connect to the GenICam camera using CameraHelper with retry logic."""
         try:
             if self.camera is None:
-                devices = pylon.TlFactory.GetInstance().EnumerateDevices()
-                if not devices:
-                    QMessageBox.critical(self, "Error", "No camera devices found!")
-                    self.log_message("Error: No camera devices found.")
+                cameras = self.camera_helper.enumerate_cameras(max_retries=3, retry_delay=1.0)
+                if not cameras:
+                    QMessageBox.critical(self, "Error", "No camera devices found after multiple attempts!")
+                    self.log_message("Error: No camera devices found after multiple attempts.")
                     return
-
-                self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateDevice(devices[0]))
-                self.camera.Open()
-
+                # Connect to the first available camera
+                try:
+                    self.camera = self.camera_helper.connect_camera(cameras[0])
+                except RuntimeError as e:
+                    QMessageBox.critical(self, "Error", f"Failed to connect to camera after retries: {e}")
+                    self.log_message(f"Error: Failed to connect to camera after retries: {e}")
+                    return
+                # Start grabbing
+                self.camera_helper.start_grabbing()
                 # Extract and display camera information
-                device_info = self.camera.GetDeviceInfo()
                 info_text = (
                     f"Device Info:\n"
-                    f"Model Name: {device_info.GetModelName()}\n"
-                    f"Manufacturer: {device_info.GetVendorName()}\n"
-                    f"Serial Number: {device_info.GetSerialNumber()}\n"
+                    f"Model Name: {cameras[0]['name']}\n"
+                    f"Interface: {cameras[0]['interface']}\n"
+                    f"Serial Number: {cameras[0]['id']}\n"
                 )
-                if "GigE" in device_info.GetDeviceClass():
-                    ip_address = device_info.GetPropertyValue("IpAddress")
-                    info_text += f"IP Address: {ip_address}\n"
-
+                if cameras[0].get('ip_address'):
+                    info_text += f"IP Address: {cameras[0]['ip_address']}\n"
                 self.device_info_label.setText(info_text)
                 self.log_message("Camera successfully started and connected.")
             else:
@@ -145,21 +161,24 @@ class CameraTester(QMainWindow):
             self.log_message("Error: Unknown test selected.")
 
     def image_acquisition_test(self):
-        """Test to acquire and display an image."""
+        """Test to acquire and display an image using CameraHelper with retry logic."""
         if self.camera:
             try:
-                grab_result = self.camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-
-                if grab_result and grab_result.GrabSucceeded():
-                    image = grab_result.Array
-                    height, width = image.shape
-                    qimage = QImage(image.data, width, height, QImage.Format_Grayscale8)
+                image = self.camera_helper.get_frame_internal()
+                if image is not None:
+                    height, width = image.shape[:2]
+                    if len(image.shape) == 2:
+                        qimage = QImage(image.data, width, height, QImage.Format_Grayscale8)
+                    else:
+                        qimage = QImage(image.data, width, height, 3 * width, QImage.Format_RGB888)
                     pixmap = QPixmap.fromImage(qimage)
                     self.live_view_label.setPixmap(pixmap)
                     self.log_message("Image Acquisition Test passed: Image displayed successfully.")
                 else:
-                    self.log_message("Image Acquisition Test failed: Image grab unsuccessful.")
+                    QMessageBox.critical(self, "Error", "Image Acquisition failed after multiple attempts.")
+                    self.log_message("Image Acquisition Test failed: Image grab unsuccessful after retries.")
             except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error during Image Acquisition Test: {e}")
                 self.log_message(f"Error during Image Acquisition Test: {e}")
         else:
             self.log_message("Image Acquisition Test failed: Camera not started.")
@@ -185,6 +204,13 @@ class CameraTester(QMainWindow):
                 self.log_message(f"Error during Feature Access Test: {e}")
         else:
             self.log_message("Feature Access Test failed: Camera not started.")
+
+    def closeEvent(self, event):
+        """Clean up resources on application close."""
+        if self.camera:
+            self.camera_helper.stop_grabbing()
+            self.camera_helper.disconnect_camera()
+        event.accept()
 
 
 if __name__ == "__main__":

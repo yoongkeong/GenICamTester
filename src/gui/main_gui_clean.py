@@ -12,7 +12,6 @@ from PyQt5.QtCore import Qt, QTimer, QDateTime
 import cv2
 import numpy as np
 from .presenter import CameraPresenter
-import os
 
 class CameraSelectionDialog(QDialog):
     def __init__(self, parent=None, cameras=None):
@@ -302,7 +301,7 @@ class CameraTestGUI(QMainWindow):
         self.camera_detection_page = QWidget()
         layout = QVBoxLayout(self.camera_detection_page)
         layout.setContentsMargins(40, 40, 40, 40)
-
+        
         # Title and description
         title = QLabel("Camera Detection")
         title.setProperty('title', True)
@@ -329,6 +328,7 @@ class CameraTestGUI(QMainWindow):
         # USB Camera section
         usb_widget = QWidget()
         usb_layout = QHBoxLayout(usb_widget)
+        
         usb_info = QWidget()
         usb_info_layout = QVBoxLayout(usb_info)
         usb_title = QLabel("USB3 Camera")
@@ -337,14 +337,15 @@ class CameraTestGUI(QMainWindow):
         usb_desc.setWordWrap(True)
         usb_info_layout.addWidget(usb_title)
         usb_info_layout.addWidget(usb_desc)
-
+        
         self.usb_button = QPushButton("Detect USB Camera")
         self.usb_button.clicked.connect(self.presenter.detect_usb_camera)
+        
         usb_layout.addWidget(usb_info)
         usb_layout.addWidget(self.usb_button)
         selection_layout.addWidget(usb_widget)
 
-        # Separator
+        # Add separator
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet(f"background-color: {self.style_dict['border']};")
@@ -353,6 +354,7 @@ class CameraTestGUI(QMainWindow):
         # GigE Camera section
         gige_widget = QWidget()
         gige_layout = QHBoxLayout(gige_widget)
+        
         gige_info = QWidget()
         gige_info_layout = QVBoxLayout(gige_info)
         gige_title = QLabel("GigE Camera")
@@ -361,225 +363,35 @@ class CameraTestGUI(QMainWindow):
         gige_desc.setWordWrap(True)
         gige_info_layout.addWidget(gige_title)
         gige_info_layout.addWidget(gige_desc)
+        
         self.gige_button = QPushButton("Detect GigE Camera")
         self.gige_button.clicked.connect(self.prompt_gige_configuration)
+        
         gige_layout.addWidget(gige_info)
         gige_layout.addWidget(self.gige_button)
         selection_layout.addWidget(gige_widget)
 
-        # Simulation mode
-        from PyQt5.QtWidgets import QCheckBox
-        self.simulation_checkbox = QCheckBox("Simulation Mode")
-        self.simulation_checkbox.setToolTip("Enable simulated camera (no hardware required)")
-        self.simulation_checkbox.stateChanged.connect(self.on_simulation_toggled)
-        selection_layout.addWidget(self.simulation_checkbox)
-
         selection_group.setLayout(selection_layout)
         layout.addWidget(selection_group)
-
+        
         # Status section
-        self.status_container = QWidget()
-        self.status_layout = QVBoxLayout(self.status_container)
-        self.status_icon = QLabel("🔍")
-        self.status_icon.setStyleSheet("font-size: 48px; margin: 20px 0;")
-        self.status_icon.setAlignment(Qt.AlignCenter)
-        self.status_layout.addWidget(self.status_icon)
         self.status_label = QLabel("Ready to detect cameras")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet(f"""
             color: {self.style_dict['text']};
-            font-size: 16px;
-            font-weight: bold;
-            margin: 10px 0;
-        """)
-        self.status_layout.addWidget(self.status_label)
-        self.status_description = QLabel("Click one of the detection buttons above to begin")
-        self.status_description.setAlignment(Qt.AlignCenter)
-        self.status_description.setStyleSheet(f"""
-            color: {self.style_dict['text']};
             font-size: 14px;
-            margin: 10px 0;
+            margin-top: 20px;
         """)
-        self.status_layout.addWidget(self.status_description)
+        layout.addWidget(self.status_label)
 
-        # Reflect startup simulation state
-        try:
-            if hasattr(self.presenter, 'camera_helper') and getattr(self.presenter.camera_helper, 'simulation_enabled', False):
-                self.simulation_checkbox.setChecked(True)
-        except Exception:
-            pass
-
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet(f"""
-            QProgressBar {{
-                border: 2px solid {self.style_dict['border']};
-                border-radius: 10px;
-                text-align: center;
-                font-weight: bold;
-                margin: 20px 0;
-            }}
-            QProgressBar::chunk {{
-                background-color: {self.style_dict['primary']};
-                border-radius: 8px;
-            }}
-        """)
-        self.status_layout.addWidget(self.progress_bar)
-
-        # Success widget
-        self.success_widget = QWidget()
-        self.success_widget.setVisible(False)
-        success_layout = QVBoxLayout(self.success_widget)
-        success_icon = QLabel("✅")
-        success_icon.setStyleSheet("font-size: 64px; margin: 20px 0;")
-        success_icon.setAlignment(Qt.AlignCenter)
-        success_layout.addWidget(success_icon)
-        success_title = QLabel("Camera Detected Successfully!")
-        success_title.setStyleSheet(f"""
-            color: {self.style_dict['success']};
-            font-size: 20px;
-            font-weight: bold;
-            margin: 10px 0;
-        """)
-        success_title.setAlignment(Qt.AlignCenter)
-        success_layout.addWidget(success_title)
-        self.camera_summary = QLabel()
-        self.camera_summary.setStyleSheet(f"""
-            color: {self.style_dict['text']};
-            font-size: 14px;
-            margin: 10px 0;
-            padding: 16px;
-            background-color: {self.style_dict['background']};
-            border-radius: 8px;
-        """)
-        self.camera_summary.setAlignment(Qt.AlignCenter)
-        self.camera_summary.setWordWrap(True)
-        success_layout.addWidget(self.camera_summary)
-        # Proceed button (remain manual to satisfy user preference: no auto-run)
-        self.proceed_button = QPushButton("Proceed to Tests")
-        self.proceed_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {self.style_dict['success']};
-                color: {self.style_dict['white']};
-                border: none;
-                padding: 16px 32px;
-                border-radius: 8px;
-                font-size: 16px;
-                font-weight: bold;
-                margin: 20px 0;
-                min-width: 200px;
-            }}
-            QPushButton:hover {{
-                background-color: #45a049;
-            }}
-        """)
-        self.proceed_button.clicked.connect(lambda: self.stacked_widget.setCurrentWidget(self.test_selection_page))
-        success_layout.addWidget(self.proceed_button)
-        self.status_layout.addWidget(self.success_widget)
-        layout.addWidget(self.status_container)
         layout.addStretch()
         self.stacked_widget.addWidget(self.camera_detection_page)
-        
-    def update_camera_detection_status(self, status, message, description="", show_progress=False, progress_value=0):
-        """Update the camera detection status display"""
-        if status == "detecting":
-            self.status_icon.setText("🔍")
-            self.status_label.setText("Detecting cameras...")
-            self.status_description.setText("Please wait while we search for available cameras")
-            self.progress_bar.setVisible(show_progress)
-            if show_progress:
-                self.progress_bar.setValue(progress_value)
-            self.success_widget.setVisible(False)
-            
-        elif status == "success":
-            self.status_icon.setText("✅")
-            self.status_label.setText("Camera Detected!")
-            self.status_description.setText(message)
-            self.progress_bar.setVisible(False)
-            self.success_widget.setVisible(True)
-            
-        elif status == "error":
-            self.status_icon.setText("❌")
-            self.status_label.setText("Detection Failed")
-            self.status_description.setText(message)
-            self.progress_bar.setVisible(False)
-            self.success_widget.setVisible(False)
-            
-        elif status == "warning":
-            self.status_icon.setText("⚠️")
-            self.status_label.setText("No Cameras Found")
-            self.status_description.setText(message)
-            self.progress_bar.setVisible(False)
-            self.success_widget.setVisible(False)
-            
-        elif status == "ready":
-            self.status_icon.setText("🔍")
-            self.status_label.setText("Ready to detect cameras")
-            self.status_description.setText("Click one of the detection buttons above to begin")
-            self.progress_bar.setVisible(False)
-            self.success_widget.setVisible(False)
-            
-    def update_camera_summary(self, camera_info):
-        """Update the camera summary display in the success state"""
-        if camera_info:
-            summary_text = f"""
-            <b>Model:</b> {camera_info.get('name', 'Unknown')}<br>
-            <b>Serial Number:</b> {camera_info.get('id', 'Unknown')}<br>
-            <b>Interface:</b> {camera_info.get('interface', 'Unknown')}<br>
-            <b>Status:</b> Connected and Ready
-            """
-            self.camera_summary.setText(summary_text)
 
     def prompt_gige_configuration(self):
         config_dialog = CameraConfigDialog(self)
         if config_dialog.exec_() == QDialog.Accepted:
             use_dhcp, ip_settings = config_dialog.get_configuration()
             self.presenter.detect_gige_camera(use_dhcp, ip_settings)
-
-    def on_simulation_toggled(self, state):
-        """Enable or disable simulation mode at runtime."""
-        enabled = bool(state)
-        try:
-            if not hasattr(self.presenter, 'camera_helper'):
-                return
-            self.presenter.camera_helper.simulation_enabled = enabled
-            if enabled:
-                if not getattr(self.presenter, 'camera', None):
-                    # Connect and immediately transition to test selection flow
-                    self.update_camera_detection_status("detecting", "Starting simulation camera...", show_progress=True, progress_value=50)
-                    sim_cam = self.presenter.camera_helper.connect_camera(None)
-                    if sim_cam:
-                        fake_info = {"name": "Simulation Camera", "id": "SIM-0000", "interface": "SIM"}
-                        self.presenter.camera = sim_cam
-                        # Update details (no success screen shown)
-                        self.update_camera_summary(fake_info)
-                        # Hide success widget if it was left from a previous physical detection
-                        if hasattr(self, 'success_widget'):
-                            self.success_widget.setVisible(False)
-                        # Ensure test selection page exists
-                        if not hasattr(self, 'test_selection_page'):
-                            try:
-                                self.init_test_selection_page()
-                            except Exception as e:
-                                self.log_message(f"Failed to init test selection page: {e}", "ERROR")
-                        # Navigate directly to tests page
-                        def _go_tests():
-                            if hasattr(self, 'test_selection_page'):
-                                self.stacked_widget.setCurrentWidget(self.test_selection_page)
-                                self.log_message("Simulation camera ready. Running in simulation mode. Select any test to begin.", "SUCCESS")
-                        QTimer.singleShot(100, _go_tests)
-                    else:
-                        self.update_camera_detection_status("error", "Failed to start simulation camera")
-                        self.log_message("Simulation camera failed to initialize.", "ERROR")
-            else:
-                # Reset to ready state when simulation disabled
-                if hasattr(self, 'success_widget'):
-                    self.success_widget.setVisible(False)
-                self.update_camera_detection_status("ready", "Simulation disabled. Select an interface to detect cameras.")
-                self.log_message("Simulation mode disabled.", "INFO")
-        except Exception as e:
-            self.log_message(f"Simulation toggle error: {e}", "ERROR")
 
     def init_live_view_page(self):
         self.live_view_page = QWidget()
@@ -628,191 +440,92 @@ class CameraTestGUI(QMainWindow):
 
     def init_test_selection_page(self):
         self.test_selection_page = QWidget()
-        page_layout = QVBoxLayout(self.test_selection_page)
-        page_layout.setContentsMargins(20, 20, 20, 20)
-
-        # Top navigation bar
-        top_nav = QHBoxLayout()
-        back_main_btn = QPushButton("← Back to Main Menu")
-        back_main_btn.setToolTip("Return to the welcome page")
-        back_main_btn.clicked.connect(lambda: self.stacked_widget.setCurrentWidget(self.welcome_page))
-        top_nav.addWidget(back_main_btn, alignment=Qt.AlignLeft)
-        top_nav.addStretch()
-        page_layout.addLayout(top_nav)
-
-        # Header layout containing left info panel and right test groups
-        header_widget = QWidget()
-        header_layout = QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Left: Camera info / quick actions
+        layout = QHBoxLayout(self.test_selection_page)
+        
+        # Left panel - Test buttons
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-
-        info_group = QGroupBox("📷 Camera Information")
-        info_layout = QVBoxLayout()
-        self.camera_details_widget = QTextEdit()
-        self.camera_details_widget.setReadOnly(True)
-        self.camera_details_widget.setMaximumHeight(180)
-        info_layout.addWidget(self.camera_details_widget)
-        self.doc_link = QLabel()
-        self.doc_link.setOpenExternalLinks(True)
-        info_layout.addWidget(self.doc_link)
-        info_group.setLayout(info_layout)
-        left_layout.addWidget(info_group)
-
-        quick_group = QGroupBox("⚡ Quick Actions")
-        quick_layout = QHBoxLayout()
-        live_btn = QPushButton("🎥 Live View")
-        live_btn.clicked.connect(lambda: self.stacked_widget.setCurrentWidget(self.live_view_page))
-        snap_btn = QPushButton("📸 Snap Image")
-        snap_btn.clicked.connect(self.snap_image)
-        quick_layout.addWidget(live_btn)
-        quick_layout.addWidget(snap_btn)
-        quick_group.setLayout(quick_layout)
-        left_layout.addWidget(quick_group)
-
-        disc_btn = QPushButton("🔌 Disconnect Camera")
-        disc_btn.clicked.connect(self.disconnect_camera)
-        left_layout.addWidget(disc_btn)
-        left_layout.addStretch()
-        header_layout.addWidget(left_panel, 3)
-
-        # Right: Test groups
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        title = QLabel("🧪 Camera Tests")
+        
+        title = QLabel("Camera Tests")
         title.setProperty('title', True)
-        title.setAlignment(Qt.AlignCenter)
-        right_layout.addWidget(title)
+        left_layout.addWidget(title)
 
-        # Scroll container (simple vertical container here)
-        tests_container = QVBoxLayout()
-
-        groups = [
-            ("🔧 Basic Camera Tests", "Fundamental camera operations and initialization", [
-                ("Feature Access Test", self.run_feature_tests, "Test camera feature access"),
-                ("Image Acquisition Test", self.run_image_acquisition_test, "Test image capture"),
-                ("Camera Initialization Test", self.run_init_cam_test, "Test camera initialization"),
-                ("Image Quality Test", self.run_image_quality_tests, "Test image quality metrics")
-            ], self.style_dict['primary']),
-            ("⚡ Performance Tests", "Camera performance and speed testing", [
-                ("Max FPS Test", self.run_max_fps_test, "Test maximum frame rate"),
-                ("ROI Test", self.run_roi_test, "Test region of interest functionality"),
-                ("Long Run Test", self.run_long_run_test, "Extended stability testing")
-            ], self.style_dict['success']),
-            ("🖼️ Image Processing Tests", "Advanced image analysis and processing", [
-                ("Camera Calibration", self.run_camera_calibration, "Camera calibration testing"),
-                ("Edge Detection", self.run_edge_detection, "Edge detection algorithms"),
-                ("Blur Detection", self.run_blur_detection, "Image blur detection")
-            ], self.style_dict['secondary']),
-            ("🚀 Advanced Tests", "Complex scenarios and power / IO", [
-                ("Multi-Camera Test", self.run_multicam_test, "Test multiple cameras"),
-                ("Power GigE Test", self.run_power_gige_test, "GigE power management"),
-                ("Power USB Test", self.run_power_usb_test, "USB power management"),
-                ("IO Test", self.run_io_test, "Input/Output testing"),
-                ("Power Cycle Test", self.run_power_cycle_test, "Power cycle testing")
-            ], self.style_dict['warning'])
+        # Expanded test buttons
+        test_buttons = [
+            ("Live View", lambda: self.stacked_widget.setCurrentWidget(self.live_view_page)),
+            ("Snap Image", self.snap_image),
+            ("Feature Access Test", self.run_feature_tests),
+            ("Image Acquisition Test", self.run_image_acquisition_test),
+            ("Max FPS Test", self.run_max_fps_test),
+            ("ROI Test", self.run_roi_test),
+            ("Image Quality Test", self.run_image_quality_tests),
+            ("Long Run Test", self.run_long_run_test),
+            ("Power Cycle Test", self.run_power_cycle_test),
+            ("Camera Calibration", self.run_camera_calibration),
+            ("Edge Detection", self.run_edge_detection),
+            ("Blur Detection", self.run_blur_detection),
+            ("Multi-Camera Test", self.run_multicam_test),
+            ("Power GigE Test", self.run_power_gige_test),
+            ("Power USB Test", self.run_power_usb_test),
+            ("IO Test", self.run_io_test)
         ]
 
-        for g_title, g_desc, g_tests, g_color in groups:
-            group_widget = self._create_test_group(g_title, g_desc, g_tests, g_color)
-            tests_container.addWidget(group_widget)
-        tests_container.addStretch()
-
-        # Wrap container
-        wrap = QWidget()
-        wrap.setLayout(tests_container)
-        right_layout.addWidget(wrap)
-        header_layout.addWidget(right_panel, 7)
-
-        page_layout.addWidget(header_widget)
-        self.stacked_widget.addWidget(self.test_selection_page)
-        
-    def _create_test_group(self, title, description, tests, color):
-        """Create a test group with the given title, description, and tests"""
-        group_widget = QWidget()
-        group_layout = QVBoxLayout(group_widget)
-        group_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Group header
-        header_widget = QWidget()
-        header_layout = QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Icon and title
-        title_label = QLabel(title)
-        title_label.setStyleSheet(f"""
-            font-size: 16px;
-            font-weight: bold;
-            color: {color};
-            margin: 0;
-        """)
-        header_layout.addWidget(title_label)
-        header_layout.addStretch()
-        
-        group_layout.addWidget(header_widget)
-        
-        # Description
-        desc_label = QLabel(description)
-        desc_label.setStyleSheet(f"""
-            color: {self.style_dict['text']};
-            font-size: 12px;
-            font-style: italic;
-            margin: 0 0 12px 0;
-        """)
-        group_layout.addWidget(desc_label)
-        
-        # Test buttons in a grid layout
-        buttons_widget = QWidget()
-        buttons_layout = QHBoxLayout(buttons_widget)
-        buttons_layout.setContentsMargins(0, 0, 0, 0)
-        
-        for test_name, callback, tooltip in tests:
-            btn = QPushButton(test_name)
-            btn.setToolTip(tooltip)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {self.style_dict['white']};
-                    color: {color};
-                    border: 2px solid {color};
-                    border-radius: 6px;
-                    padding: 10px 16px;
-                    font-size: 12px;
-                    font-weight: bold;
-                    min-width: 140px;
-                    max-width: 160px;
-                }}
-                QPushButton:hover {{
-                    background-color: {color};
-                    color: {self.style_dict['white']};
-                }}
-                QPushButton:pressed {{
-                    background-color: {color};
-                    color: {self.style_dict['white']};
-                }}
-            """)
+        for label, callback in test_buttons:
+            btn = QPushButton(label)
             btn.clicked.connect(callback)
-            buttons_layout.addWidget(btn)
+            left_layout.addWidget(btn)
         
-        buttons_layout.addStretch()
-        group_layout.addWidget(buttons_widget)
-        
-        # Add some spacing
-        group_layout.addSpacing(16)
-        
-        # Style the group container
-        group_widget.setStyleSheet(f"""
-            QWidget {{
-                background-color: {self.style_dict['white']};
-                border: 1px solid {self.style_dict['border']};
-                border-radius: 8px;
-                padding: 16px;
-                margin: 8px 0;
+        # Add disconnect button at the bottom
+        disconnect_btn = QPushButton("Disconnect Camera")
+        disconnect_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.style_dict['error']};
+                color: {self.style_dict['white']};
+            }}
+            QPushButton:hover {{
+                background-color: #c82333;
             }}
         """)
+        disconnect_btn.clicked.connect(self.disconnect_camera)
+        left_layout.addStretch()
+        left_layout.addWidget(disconnect_btn)
         
-        return group_widget
+        layout.addWidget(left_panel)
+        
+        # Right panel - Camera details
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Camera info group
+        info_group = QGroupBox("Camera Information")
+        info_layout = QVBoxLayout()
+        
+        self.camera_details_widget = QTextEdit()
+        self.camera_details_widget.setReadOnly(True)
+        self.camera_details_widget.setStyleSheet("""
+            QTextEdit {
+                background-color: #ffffff;
+                border: none;
+                font-size: 12px;
+            }
+        """)
+        info_layout.addWidget(self.camera_details_widget)
+        
+        # Documentation link
+        self.doc_link = QLabel()
+        self.doc_link.setOpenExternalLinks(True)  # Enable clickable links
+        info_layout.addWidget(self.doc_link)
+        
+        info_group.setLayout(info_layout)
+        right_layout.addWidget(info_group)
+        
+        layout.addWidget(right_panel)
+        
+        # Set the stretch factor for panels (1:1 ratio)
+        layout.setStretch(0, 1)
+        layout.setStretch(1, 1)
+        
+        self.stacked_widget.addWidget(self.test_selection_page)
         
     def update_camera_details(self, details):
         """Update the camera details panel with provided information"""
@@ -892,49 +605,9 @@ class CameraTestGUI(QMainWindow):
         """Run feature access tests"""
         self.presenter.run_feature_tests()
 
-    def run_image_acquisition_test(self):
-        """Run image acquisition test"""
-        self.presenter.run_image_acquisition_test()
-
-    def run_max_fps_test(self):
-        """Run max FPS test"""
-        self.presenter.run_max_fps_test()
-
-    def run_roi_test(self):
-        """Run ROI test"""
-        self.presenter.run_roi_test()
-
     def run_image_quality_tests(self):
         """Run image quality tests"""
         self.presenter.run_image_quality_tests()
-
-    def run_camera_calibration(self):
-        """Run camera calibration"""
-        self.presenter.run_camera_calibration()
-
-    def run_edge_detection(self):
-        """Run edge detection"""
-        self.presenter.run_edge_detection()
-
-    def run_blur_detection(self):
-        """Run blur detection"""
-        self.presenter.run_blur_detection()
-
-    def run_multicam_test(self):
-        """Run multi-camera test"""
-        self.presenter.run_multicam_test()
-
-    def run_power_gige_test(self):
-        """Run power GigE test"""
-        self.presenter.run_power_gige_test()
-
-    def run_power_usb_test(self):
-        """Run power USB test"""
-        self.presenter.run_power_usb_test()
-
-    def run_io_test(self):
-        """Run IO test"""
-        self.presenter.run_io_test()
 
     def run_performance_tests(self):
         """Run performance tests"""
@@ -944,14 +617,6 @@ class CameraTestGUI(QMainWindow):
         """Show long run test dialog"""
         dialog = LongRunTestDialog(self)
         dialog.exec_()
-
-    def run_power_cycle_test(self):
-        """Run power cycle test"""
-        self.presenter.run_power_cycle_test()
-
-    def run_init_cam_test(self):
-        """Run camera initialization test"""
-        self.presenter.run_init_cam_test()
 
     def update_live_view(self):
         """Update the live view with the current frame"""
@@ -1009,138 +674,42 @@ class CameraTestGUI(QMainWindow):
         QMessageBox.critical(self, title, message)
 
     def update_test_results(self, title, results):
-        """Show test results in a dialog with save/back options"""
+        """Update the test results in the UI"""
+        # Create a dialog to show test results
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
-        dialog.resize(700, 500)
-
-        main_layout = QVBoxLayout(dialog)
-
-        # Results text area
+        dialog.setMinimumWidth(600)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout()
+        
+        # Create a text area for results with monospace font
         text_area = QTextEdit()
         text_area.setReadOnly(True)
         text_area.setStyleSheet("QTextEdit { font-family: monospace; }")
         text_area.setText(results)
+        
+        # Make text selectable and copy-able
         text_area.setTextInteractionFlags(
-            Qt.TextSelectableByMouse |
+            Qt.TextSelectableByMouse | 
             Qt.TextSelectableByKeyboard |
             Qt.LinksAccessibleByMouse
         )
-        main_layout.addWidget(text_area)
-
-        # Buttons row
-        buttons = QHBoxLayout()
-
-        back_btn = QPushButton("← Back to Tests")
-        back_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {self.style_dict['warning']};
-                color: {self.style_dict['white']};
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: #e0a800; }}
-        """)
-        def _back():
-            dialog.reject()
-            if hasattr(self, 'test_selection_page'):
-                self.stacked_widget.setCurrentWidget(self.test_selection_page)
-        back_btn.clicked.connect(_back)
-        buttons.addWidget(back_btn)
-
-        save_std_btn = QPushButton("💾 Save (Standard Name)")
-        save_std_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {self.style_dict['success']};
-                color: {self.style_dict['white']};
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: #45a049; }}
-        """)
-        save_std_btn.clicked.connect(lambda: self._save_with_standard_name(title, results, dialog))
-        buttons.addWidget(save_std_btn)
-
-        save_as_btn = QPushButton("📁 Save As...")
-        save_as_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {self.style_dict['secondary']};
-                color: {self.style_dict['white']};
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: #0056b3; }}
-        """)
-        save_as_btn.clicked.connect(lambda: self._save_test_results(results))
-        buttons.addWidget(save_as_btn)
-
-        buttons.addStretch()
-
-        ok_btn = QPushButton("OK")
-        ok_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {self.style_dict['primary']};
-                color: {self.style_dict['white']};
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: {self.style_dict['secondary']}; }}
-        """)
-        ok_btn.clicked.connect(dialog.accept)
-        buttons.addWidget(ok_btn)
-
-        main_layout.addLayout(buttons)
-        dialog.setLayout(main_layout)
+        layout.addWidget(text_area)
+        
+        # Add OK button
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Save)
+        buttons.accepted.connect(dialog.accept)
+        buttons.button(QDialogButtonBox.Save).clicked.connect(
+            lambda: self._save_test_results(results)
+        )
+        layout.addWidget(buttons)
+        
+        dialog.setLayout(layout)
         dialog.exec_()
         
-    def _save_with_standard_name(self, test_name, results, dialog):
-        """Save test results using the standardized filename format"""
-        try:
-            # Get camera information for filename
-            device_serial = "Unknown"
-            model_name = "Unknown"
-            
-            if hasattr(self, 'presenter') and self.presenter.camera_helper:
-                try:
-                    # Try to get camera info from the helper
-                    if hasattr(self.presenter.camera_helper, 'camera') and self.presenter.camera_helper.camera:
-                        # Get serial number
-                        if hasattr(self.presenter.camera_helper.camera, 'DeviceSerialNumber'):
-                            device_serial = self.presenter.camera_helper.camera.DeviceSerialNumber.GetValue()
-                        # Get model name
-                        if hasattr(self.presenter.camera_helper.camera, 'DeviceModelName'):
-                            model_name = self.presenter.camera_helper.camera.DeviceModelName.GetValue()
-                except Exception as e:
-                    self.log_message(f"Could not get camera info for filename: {str(e)}", "WARNING")
-            
-            # Save with standard name
-            saved_path = self.save_test_results_with_standard_name(
-                test_name, results, device_serial, model_name
-            )
-            
-            if saved_path:
-                # Close the dialog after successful save
-                dialog.accept()
-                
-        except Exception as e:
-            error_msg = f"Error saving with standard name: {str(e)}"
-            self.log_message(error_msg, "ERROR")
-            self.show_error("Save Error", error_msg)
-
     def _save_test_results(self, results):
-        """Save test results to a file with custom name"""
+        """Save test results to a file"""
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "Save Test Results",
@@ -1149,86 +718,11 @@ class CameraTestGUI(QMainWindow):
         )
         if file_name:
             try:
-                with open(file_name, 'w', encoding='utf-8') as f:
+                with open(file_name, 'w') as f:
                     f.write(results)
                 self.log_message(f"Test results saved to {file_name}", "INFO")
             except Exception as e:
                 self.show_error("Save Error", f"Could not save test results: {str(e)}")
-
-    def generate_test_filename(self, test_name, device_serial=None, model_name=None):
-        """Generate a standardized filename for test results
-        
-        Format: "TestName"_"DeviceSerialNUMBER"_"ModelName"_"Timestamp"
-        Example: CollectDeviceInfoTest_123456_BaslerAce_20250812_153045.txt
-        
-        Args:
-            test_name (str): Name of the test
-            device_serial (str): Device serial number
-            model_name (str): Device model name
-            
-        Returns:
-            str: Generated filename
-        """
-        # Get current timestamp in YYYYMMDD_HHMMSS format
-        timestamp = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
-        
-        # Clean up test name (remove spaces, special chars)
-        clean_test_name = test_name.replace(" ", "").replace("-", "").replace("_", "")
-        
-        # Use provided values or defaults
-        serial = device_serial or "Unknown"
-        model = model_name or "Unknown"
-        
-        # Clean up model name (remove spaces, special chars)
-        clean_model = model.replace(" ", "").replace("-", "").replace("_", "")
-        
-        # Generate filename
-        filename = f"{clean_test_name}_{serial}_{clean_model}_{timestamp}.txt"
-        
-        return filename
-        
-    def save_test_results_with_standard_name(self, test_name, results, device_serial=None, model_name=None):
-        """Save test results using the standardized filename format"""
-        try:
-            # Generate standard filename
-            filename = self.generate_test_filename(test_name, device_serial, model_name)
-            
-            # Get save directory from user
-            save_dir = QFileDialog.getExistingDirectory(
-                self,
-                "Select Directory to Save Test Results",
-                "",
-                QFileDialog.ShowDirsOnly
-            )
-            
-            if save_dir:
-                file_path = os.path.join(save_dir, filename)
-                
-                # Save the file
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(results)
-                
-                self.log_message(f"Test results saved to {file_path}", "SUCCESS")
-                
-                # Show success message
-                QMessageBox.information(
-                    self,
-                    "Save Successful",
-                    f"Test results saved successfully!\n\n"
-                    f"File: {filename}\n"
-                    f"Location: {save_dir}"
-                )
-                
-                return file_path
-            else:
-                self.log_message("Save cancelled by user", "INFO")
-                return None
-                
-        except Exception as e:
-            error_msg = f"Error saving test results: {str(e)}"
-            self.log_message(error_msg, "ERROR")
-            self.show_error("Save Error", error_msg)
-            return None
 
 class CameraConfigDialog(QDialog):
     def __init__(self, parent=None):
@@ -1488,126 +982,93 @@ class LongRunTestDialog(QDialog):
                                   f"Total frames captured: {self.frame_count:,}\n"
                                   f"Average FPS: {self.frame_count / self.total_seconds:.1f}")
 
-class TestProgressDialog(QDialog):
-    """Progress dialog for showing test execution progress"""
-    def __init__(self, parent=None, test_name="Test", max_steps=100):
-        super().__init__(parent)
-        self.setWindowTitle(f"Running {test_name}")
-        self.setFixedSize(500, 200)
-        self.setModal(True)
-        
-        # Layout
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        
-        # Test name
-        title_label = QLabel(f"🧪 {test_name}")
-        title_label.setStyleSheet("""
-            font-size: 18px;
-            font-weight: bold;
-            color: #00427E;
-            margin: 10px 0;
-        """)
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
-        
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, max_steps)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 2px solid #E9ECEF;
-                border-radius: 10px;
-                text-align: center;
-                font-weight: bold;
-                margin: 20px 0;
-            }
-            QProgressBar::chunk {
-                background-color: #005CAB;
-                border-radius: 8px;
-            }
-        """)
-        layout.addWidget(self.progress_bar)
-        
-        # Status label
-        self.status_label = QLabel("Initializing test...")
-        self.status_label.setStyleSheet("""
-            font-size: 14px;
-            color: #333333;
-            margin: 10px 0;
-        """)
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-        
-        # Cancel button
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setStyleSheet("""
-            QPushButton {
-                background-color: #DC3545;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 14px;
-                font-weight: bold;
-                min-width: 100px;
-            }
-            QPushButton:hover {
-                background-color: #c82333;
-            }
-        """)
-        self.cancel_button.clicked.connect(self.reject)
-        layout.addWidget(self.cancel_button)
-        
-        # State
-        self.current_step = 0
-        self.max_steps = max_steps
-        self.is_cancelled = False
-        
-    def update_progress(self, step, status_text):
-        """Update progress bar and status text"""
-        self.current_step = step
-        self.progress_bar.setValue(step)
-        self.status_label.setText(status_text)
-        
-        # Process events to update UI
-        QApplication.processEvents()
-        
-    def update_status(self, status_text):
-        """Update only the status text"""
-        self.status_label.setText(status_text)
-        QApplication.processEvents()
-        
-    def set_progress_range(self, min_val, max_val):
-        """Set the progress bar range"""
-        self.progress_bar.setRange(min_val, max_val)
-        
-    def complete(self):
-        """Mark test as complete"""
-        self.progress_bar.setValue(self.max_steps)
-        self.status_label.setText("Test completed successfully!")
-        self.cancel_button.setText("Close")
-        self.cancel_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 14px;
-                font-weight: bold;
-                min-width: 100px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        
-    def was_cancelled(self):
-        """Check if test was cancelled"""
-        return self.is_cancelled
+    def run_image_acquisition_test(self):
+        """Run image acquisition test"""
+        if hasattr(self.presenter, 'run_image_acquisition_test'):
+            result = self.presenter.run_image_acquisition_test()
+            self.update_test_results("Image Acquisition Test", str(result))
+        else:
+            self.log_message("Image Acquisition Test not implemented in presenter.", "ERROR")
+
+    def run_max_fps_test(self):
+        """Run max FPS test"""
+        if hasattr(self.presenter, 'run_max_fps_test'):
+            result = self.presenter.run_max_fps_test()
+            self.update_test_results("Max FPS Test", str(result))
+        else:
+            self.log_message("Max FPS Test not implemented in presenter.", "ERROR")
+
+    def run_roi_test(self):
+        """Run ROI test"""
+        if hasattr(self.presenter, 'run_roi_test'):
+            result = self.presenter.run_roi_test()
+            self.update_test_results("ROI Test", str(result))
+        else:
+            self.log_message("ROI Test not implemented in presenter.", "ERROR")
+
+    def run_power_cycle_test(self):
+        """Run power cycle test"""
+        if hasattr(self.presenter, 'run_power_cycle_test'):
+            result = self.presenter.run_power_cycle_test()
+            self.update_test_results("Power Cycle Test", str(result))
+        else:
+            self.log_message("Power Cycle Test not implemented in presenter.", "ERROR")
+
+    def run_camera_calibration(self):
+        """Run camera calibration test"""
+        if hasattr(self.presenter, 'run_camera_calibration'):
+            result = self.presenter.run_camera_calibration()
+            self.update_test_results("Camera Calibration", str(result))
+        else:
+            self.log_message("Camera Calibration not implemented in presenter.", "ERROR")
+
+    def run_edge_detection(self):
+        """Run edge detection test"""
+        if hasattr(self.presenter, 'run_edge_detection'):
+            result = self.presenter.run_edge_detection()
+            self.update_test_results("Edge Detection", str(result))
+        else:
+            self.log_message("Edge Detection not implemented in presenter.", "ERROR")
+
+    def run_blur_detection(self):
+        """Run blur detection test"""
+        if hasattr(self.presenter, 'run_blur_detection'):
+            result = self.presenter.run_blur_detection()
+            self.update_test_results("Blur Detection", str(result))
+        else:
+            self.log_message("Blur Detection not implemented in presenter.", "ERROR")
+
+    def run_multicam_test(self):
+        """Run multi-camera test"""
+        if hasattr(self.presenter, 'run_multicam_test'):
+            result = self.presenter.run_multicam_test()
+            self.update_test_results("Multi-Camera Test", str(result))
+        else:
+            self.log_message("Multi-Camera Test not implemented in presenter.", "ERROR")
+
+    def run_power_gige_test(self):
+        """Run power GigE test"""
+        if hasattr(self.presenter, 'run_power_gige_test'):
+            result = self.presenter.run_power_gige_test()
+            self.update_test_results("Power GigE Test", str(result))
+        else:
+            self.log_message("Power GigE Test not implemented in presenter.", "ERROR")
+
+    def run_power_usb_test(self):
+        """Run power USB test"""
+        if hasattr(self.presenter, 'run_power_usb_test'):
+            result = self.presenter.run_power_usb_test()
+            self.update_test_results("Power USB Test", str(result))
+        else:
+            self.log_message("Power USB Test not implemented in presenter.", "ERROR")
+
+    def run_io_test(self):
+        """Run IO test"""
+        if hasattr(self.presenter, 'run_io_test'):
+            result = self.presenter.run_io_test()
+            self.update_test_results("IO Test", str(result))
+        else:
+            self.log_message("IO Test not implemented in presenter.", "ERROR")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

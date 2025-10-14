@@ -1,8 +1,6 @@
 import cv2
 import numpy as np
-import pytest
-import sys
-import os
+import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from lib.camera_helper import CameraHelper
 
@@ -21,7 +19,10 @@ class EdgeDetection:
 
     def detect_edges(self, image):
         """Detect edges in the given image using Canny edge detection"""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if len(image.shape) == 2 or (len(image.shape) == 3 and image.shape[2] == 1):
+            gray = image
+        else:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, self.threshold1, self.threshold2)
         return edges
@@ -41,22 +42,4 @@ class EdgeDetection:
         edge_pixels = np.count_nonzero(edges)
         return (edge_pixels / total_pixels) * 100
 
-# Test fixtures and functions for pytest
-@pytest.fixture(scope='module')
-def camera():
-    camera_helper = CameraHelper()
-    camera_helper.connect_camera(ip_address="192.168.1.10")
-    yield camera_helper
-    camera_helper.disconnect_camera()
-
-def test_edge_detection(camera):
-    detector = EdgeDetection()
-    detector.set_camera(camera)
-    
-    # Test edge detection on a captured image
-    edges = detector.capture_and_detect()
-    assert edges is not None, "Edge detection failed"
-    
-    # Test edge percentage calculation
-    percentage = detector.get_edge_percentage(detector.camera_helper.camera.GrabOne(1000).Array)
-    assert 0 <= percentage <= 100, "Edge percentage calculation failed"
+# Embedded tests removed; see dedicated test file in src/tests

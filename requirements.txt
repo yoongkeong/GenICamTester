@@ -3,7 +3,7 @@ pytest
 pytest-cov
 opencv-python
 loguru
-pyQt5
+PyQt5
 numpy
 pillow
 matplotlib

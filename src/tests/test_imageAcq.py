@@ -98,16 +98,9 @@ class TestImageAcquisition:
             }
 
 # Test fixtures and functions for pytest
-@pytest.fixture(scope='module')
-def camera():
-    camera_helper = CameraHelper()
-    camera_helper.connect_camera(ip_address="192.168.1.10")
-    yield camera_helper
-    camera_helper.disconnect_camera()
-
-def test_image_acquisition(camera):
+def test_image_acquisition(camera_helper):
     test = TestImageAcquisition()
-    test.setup(camera)
+    test.setup(camera_helper)
     test.set_test_parameters(num_frames=10)  # Shorter test for pytest
     
     # Test continuous acquisition

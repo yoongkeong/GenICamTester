@@ -203,19 +203,58 @@ class CameraPresenter:
                 self.view.log_message(error_msg, "ERROR")
             return None
 
+    def snap_image(self):
+        """Capture a single image from the camera"""
+        try:
+            self.logger.info("Capturing single image")
+            
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Capture image
+            frame = self.get_current_frame()
+            if frame is not None:
+                self.logger.info("Image captured successfully")
+                self.view.log_message("Image captured successfully", "SUCCESS")
+                
+                # Save image to file
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"snap_image_{timestamp}.png"
+                cv2.imwrite(filename, frame)
+                self.logger.info(f"Image saved to {filename}")
+                self.view.log_message(f"Image saved to {filename}", "SUCCESS")
+                
+                return True
+            else:
+                self.logger.warning("Failed to capture image")
+                self.view.log_message("Failed to capture image", "WARNING")
+                return False
+                
+        except Exception as e:
+            error_msg = f"Image capture failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.log_message(error_msg, "ERROR")
+            return False
+
     def detect_usb_camera(self):
         """Detect and connect to a USB camera"""
         try:
             self.logger.info("Starting USB camera discovery...")
+            self.view.update_camera_detection_status("detecting", "Searching for USB cameras...", show_progress=True, progress_value=25)
+            
             if self.camera_helper is None:
                 raise RuntimeError("Camera helper not initialized")
                 
             # Get list of available cameras
+            self.view.update_camera_detection_status("detecting", "Enumerating available cameras...", show_progress=True, progress_value=50)
             cameras = self.camera_helper.get_usb_cameras()
+            
             if not cameras:
+                self.view.update_camera_detection_status("warning", "No USB cameras found. Please check your connection and try again.")
                 self.view.log_message("No USB cameras found", "WARNING")
                 return
                 
+            self.view.update_camera_detection_status("detecting", "Selecting camera...", show_progress=True, progress_value=75)
             selected_camera = None
             if len(cameras) == 1:
                 selected_camera = cameras[0]
@@ -227,8 +266,11 @@ class CameraPresenter:
             
             if selected_camera:
                 # Connect to the selected camera
+                self.view.update_camera_detection_status("detecting", "Connecting to camera...", show_progress=True, progress_value=90)
                 self.camera = self.camera_helper.connect_camera(selected_camera)
                 if self.camera:
+                    self.view.update_camera_detection_status("success", f"Successfully connected to {selected_camera.get('name', 'Unknown')}")
+                    self.view.update_camera_summary(selected_camera)
                     self.view.log_message(
                         f"Successfully connected to camera: {selected_camera.get('name', 'Unknown')} "
                         f"(SN: {selected_camera.get('id', 'Unknown')})",
@@ -236,14 +278,84 @@ class CameraPresenter:
                     )
                     # Update camera details
                     self.update_camera_details(selected_camera)
-                    # Switch to test selection page
-                    self.view.stacked_widget.setCurrentWidget(self.view.test_selection_page)
                 else:
+                    self.view.update_camera_detection_status("error", "Failed to connect to camera. Please check your connection and try again.")
                     self.view.log_message("Failed to connect to camera", "ERROR")
+            else:
+                self.view.update_camera_detection_status("warning", "No camera selected. Please try again.")
             
         except Exception as e:
             self.logger.error(f"USB camera detection error: {str(e)}")
+            self.view.update_camera_detection_status("error", f"Error detecting USB camera: {str(e)}")
             self.view.log_message(f"Error detecting USB camera: {str(e)}", "ERROR")
+
+    def detect_gige_camera(self, use_dhcp, ip_settings):
+        """Detect and connect to GigE camera"""
+        try:
+            self.logger.info("Starting GigE camera detection")
+            self.view.update_camera_detection_status("detecting", "Searching for GigE cameras...", show_progress=True, progress_value=25)
+            
+            if use_dhcp:
+                self.logger.info("Using DHCP for camera detection")
+                self.view.update_camera_detection_status("detecting", "Using DHCP to detect cameras...", show_progress=True, progress_value=50)
+                # Use DHCP to find camera
+                cameras = self.camera_helper.enumerate_cameras()
+                if cameras:
+                    # Connect to the first available camera
+                    camera = cameras[0]
+                    self.logger.info(f"Found camera: {camera}")
+                    self.view.update_camera_detection_status("detecting", "Connecting to camera...", show_progress=True, progress_value=75)
+                    # Pass the discovered camera info to the connector
+                    self.camera = self.camera_helper.connect_camera(camera)
+                    self.view.update_camera_detection_status("success", f"GigE camera connected via DHCP: {camera.get('name', 'Unknown')}")
+                    self.view.update_camera_summary(camera)
+                    self.view.log_message("GigE camera connected via DHCP", "SUCCESS")
+                    # Update camera details
+                    self.update_camera_details(camera)
+                    return True
+                else:
+                    self.logger.warning("No GigE cameras found via DHCP")
+                    self.view.update_camera_detection_status("warning", "No GigE cameras found via DHCP. Please check your network connection.")
+                    self.view.log_message("No GigE cameras found via DHCP", "WARNING")
+                    return False
+            else:
+                self.logger.info(f"Using manual IP settings: {ip_settings}")
+                self.view.update_camera_detection_status("detecting", "Connecting with manual IP settings...", show_progress=True, progress_value=50)
+                # Use manual IP settings
+                if ip_settings and 'ip_address' in ip_settings:
+                    try:
+                        # Allow helper to accept IP-based connection (simulation will always succeed)
+                        self.camera = self.camera_helper.connect_camera(None, ip_address=ip_settings['ip_address'])
+                        self.view.update_camera_detection_status("success", f"GigE camera connected to {ip_settings['ip_address']}")
+                        # Create a dummy camera info for display
+                        camera_info = {
+                            'name': 'GigE Camera',
+                            'id': 'Manual IP',
+                            'interface': 'GigE',
+                            'ip_address': ip_settings['ip_address']
+                        }
+                        self.view.update_camera_summary(camera_info)
+                        self.view.log_message(f"GigE camera connected to {ip_settings['ip_address']}", "SUCCESS")
+                        return True
+                    except Exception as e:
+                        error_msg = f"Failed to connect to camera at {ip_settings['ip_address']}: {str(e)}"
+                        self.logger.error(error_msg)
+                        self.view.update_camera_detection_status("error", error_msg)
+                        self.view.log_message(error_msg, "ERROR")
+                        return False
+                else:
+                    error_msg = "Invalid IP settings provided"
+                    self.logger.error(error_msg)
+                    self.view.update_camera_detection_status("error", error_msg)
+                    self.view.log_message(error_msg, "ERROR")
+                    return False
+                    
+        except Exception as e:
+            error_msg = f"GigE camera detection failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.update_camera_detection_status("error", error_msg)
+            self.view.log_message(error_msg, "ERROR")
+            return False
 
     def update_camera_details(self, camera_info):
         """Update camera details in the GUI with enhanced error handling"""
@@ -574,6 +686,607 @@ class CameraPresenter:
             self.view.show_error("Test Error", error_msg)
             return False
 
+    def run_image_acquisition_test(self):
+        """Run image acquisition test"""
+        try:
+            from tests.test_imageAcq import TestImageAcquisition
+            
+            self.logger.info("Starting image acquisition test")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = TestImageAcquisition()
+            test.setup(self.camera_helper)
+            
+            # Run tests and get results
+            try:
+                results = test.test_continuous_acquisition()
+                
+                # Log results
+                self.logger.info(f"Image acquisition test completed: {results}")
+                
+                # Update view with results
+                summary = self._format_image_acquisition_results(results)
+                self.view.update_test_results("Image Acquisition Test", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Image acquisition test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize image acquisition test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_max_fps_test(self):
+        """Run max FPS test"""
+        try:
+            from tests.test_maxFPS import TestMaxFPS
+            
+            self.logger.info("Starting max FPS test")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = TestMaxFPS()
+            test.setup(self.camera_helper)
+            
+            # Run tests and get results
+            try:
+                results = test.test_maximum_fps()
+                
+                # Log results
+                self.logger.info(f"Max FPS test completed: {results}")
+                
+                # Update view with results
+                summary = self._format_max_fps_results(results)
+                self.view.update_test_results("Max FPS Test", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Max FPS test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize max FPS test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_roi_test(self):
+        """Run ROI test (functional version, no TestROI class).
+
+        Procedure:
+          1. Determine maximum resolution (via GenICamHelper if possible, else current Width/Height).
+          2. Exercise a sequence of ROI sizes: full, half, quarter, third.
+          3. For each ROI, set it, grab one frame, validate frame shape matches expectation.
+          4. Restore full resolution at end.
+        """
+        try:
+            self.logger.info("Starting ROI test (functional)")
+
+            # Preconditions
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            if not self.genicam_helper:
+                raise RuntimeError("GenICam helper not available")
+
+            cam = self.camera_helper.camera
+
+            # Helper to grab a single frame
+            def _grab_one():
+                grab = cam.GrabOne(500)
+                if not grab or not grab.GrabSucceeded():
+                    raise RuntimeError("Failed to grab frame")
+                arr = grab.Array
+                grab.Release()
+                return arr
+
+            # Determine full resolution
+            try:
+                max_w, max_h = self.genicam_helper.get_max_resolution()
+            except Exception:
+                # Fallback: read current ROI (Width/Height) if API available
+                try:
+                    max_w = int(cam.Width.GetValue())
+                    max_h = int(cam.Height.GetValue())
+                except Exception:
+                    frame = _grab_one()
+                    max_h, max_w = frame.shape[0], frame.shape[1]
+
+            variants = []
+            variants.append(("Full", max_w, max_h))
+            variants.append(("Half", max_w // 2, max_h // 2))
+            variants.append(("Quarter", max_w // 4, max_h // 4))
+            variants.append(("Third", max_w // 3, max_h // 3))
+
+            results_lines = [f"Detected max resolution: {max_w}x{max_h}"]
+
+            # Run through variants
+            for label, w, h in variants:
+                try:
+                    self.genicam_helper.set_roi(w, h)
+                    frame = _grab_one()
+                    fh, fw = frame.shape[0], frame.shape[1]
+                    ok = (fw == w and fh == h)
+                    results_lines.append(f"{label} ROI -> set {w}x{h}, got {fw}x{fh} : {'OK' if ok else 'MISMATCH'}")
+                    if not ok:
+                        raise AssertionError(f"ROI mismatch for {label}: expected {w}x{h}, got {fw}x{fh}")
+                except Exception as e_variant:
+                    msg = f"{label} ROI failed: {e_variant}"
+                    results_lines.append(msg)
+                    self.logger.warning(msg)
+                    # Continue to next variant
+
+            # Restore full
+            try:
+                self.genicam_helper.set_roi(max_w, max_h)
+            except Exception:
+                pass
+
+            summary = "ROI Test Results:\n" + "\n".join(results_lines)
+            self.view.update_test_results("ROI Test", summary)
+            self.logger.info("ROI test completed")
+            return True
+
+        except Exception as e:
+            error_msg = f"ROI test failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_camera_calibration(self):
+        """Run camera calibration"""
+        try:
+            from funct.funct_calibCam import CameraCalibration
+            
+            self.logger.info("Starting camera calibration")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize calibration class
+            calibration = CameraCalibration()
+            calibration.set_camera(self.camera_helper)
+            
+            # Run calibration and get results
+            try:
+                # Capture calibration images
+                images = []
+                for i in range(5):
+                    image = calibration.capture_calibration_image()
+                    images.append(image)
+                    self.logger.info(f"Captured calibration image {i+1}")
+                
+                # Perform calibration
+                success = calibration.calibrate_camera(images)
+                
+                if success:
+                    self.logger.info("Camera calibration completed successfully")
+                    self.view.update_test_results("Camera Calibration", "Calibration completed successfully!")
+                else:
+                    self.logger.warning("Camera calibration failed")
+                    self.view.update_test_results("Camera Calibration", "Calibration failed!")
+                
+                return success
+                
+            except Exception as e:
+                error_msg = f"Camera calibration execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize camera calibration: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_edge_detection(self):
+        """Run edge detection"""
+        try:
+            from funct.funct_edgeDetection import EdgeDetection
+            
+            self.logger.info("Starting edge detection")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize edge detection class
+            edge_detector = EdgeDetection()
+            edge_detector.set_camera(self.camera_helper)
+            
+            # Run edge detection and get results
+            try:
+                edges = edge_detector.capture_and_detect()
+                percentage = edge_detector.get_edge_percentage(edges)
+                
+                self.logger.info(f"Edge detection completed. Edge percentage: {percentage:.2f}%")
+                
+                # Update view with results
+                summary = f"Edge Detection Results:\nEdge percentage: {percentage:.2f}%"
+                self.view.update_test_results("Edge Detection", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Edge detection execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize edge detection: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_blur_detection(self):
+        """Run blur detection"""
+        try:
+            from funct.funct_blurDetection import BlurDetection
+            
+            self.logger.info("Starting blur detection")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize blur detection class
+            blur_detector = BlurDetection()
+            blur_detector.set_camera(self.camera_helper)
+            
+            # Run blur detection and get results
+            try:
+                is_blurry = blur_detector.test_image_blur()
+                
+                result = "Image is NOT blurry" if not is_blurry else "Image IS blurry"
+                self.logger.info(f"Blur detection completed: {result}")
+                
+                # Update view with results
+                summary = f"Blur Detection Results:\n{result}"
+                self.view.update_test_results("Blur Detection", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Blur detection execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize blur detection: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_multicam_test(self):
+        """Run multi-camera test"""
+        try:
+            from tests.test_multicam import TestMultiCam
+            
+            self.logger.info("Starting multi-camera test")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = TestMultiCam()
+            test.setup([self.camera_helper])  # Single camera for now
+            
+            # Run tests and get results
+            try:
+                results = test.test_synchronization()
+                
+                # Log results
+                self.logger.info(f"Multi-camera test completed: {results}")
+                
+                # Update view with results
+                summary = self._format_multicam_results(results)
+                self.view.update_test_results("Multi-Camera Test", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Multi-camera test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize multi-camera test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_power_gige_test(self):
+        """Run power GigE test"""
+        try:
+            from tests.test_powerGigE import TestPowerGigE
+            
+            self.logger.info("Starting power GigE test")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = TestPowerGigE()
+            test.setup(self.camera_helper)
+            
+            # Run tests and get results
+            try:
+                results = test.test_power_consumption()
+                
+                # Log results
+                self.logger.info(f"Power GigE test completed: {results}")
+                
+                # Update view with results
+                summary = self._format_power_gige_results(results)
+                self.view.update_test_results("Power GigE Test", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Power GigE test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize power GigE test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_power_usb_test(self):
+        """Run power USB test"""
+        try:
+            from tests.test_powerUSB import TestPowerUSB
+            
+            self.logger.info("Starting power USB test")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = TestPowerUSB()
+            test.setup(self.camera_helper)
+            
+            # Run tests and get results
+            try:
+                results = test.test_power_consumption()
+                
+                # Log results
+                self.logger.info(f"Power USB test completed: {results}")
+                
+                # Update view with results
+                summary = self._format_power_usb_results(results)
+                self.view.update_test_results("Power USB Test", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Power USB test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize power USB test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_io_test(self):
+        """Run IO test (adapted to new functional test implementation)"""
+        from lib.genicam_helper import GenICamHelper
+        try:
+            self.logger.info("Starting IO test (functional mode)")
+
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+
+            gh = GenICamHelper()
+            gh.set_camera(self.camera_helper.camera)
+
+            def _io_line_test(line_number):
+                try:
+                    gh.set_line_mode(line_number, "input")
+                    input_state = gh.get_line_state(line_number)
+
+                    gh.set_line_mode(line_number, "output")
+                    gh.set_line_state(line_number, True)
+                    high_state = gh.get_line_state(line_number)
+
+                    gh.set_line_state(line_number, False)
+                    low_state = gh.get_line_state(line_number)
+
+                    return {
+                        "input_test": input_state is not None,
+                        "output_high": high_state is True,
+                        "output_low": low_state is False,
+                        "overall": True
+                    }
+                except Exception as e:
+                    return {
+                        "input_test": False,
+                        "output_high": False,
+                        "output_low": False,
+                        "overall": False,
+                        "error": str(e)
+                    }
+
+            def _user_output_test():
+                try:
+                    gh.set_user_output(1, True)
+                    high_state = gh.get_user_output(1)
+                    gh.set_user_output(1, False)
+                    low_state = gh.get_user_output(1)
+                    return {"set_high": high_state is True, "set_low": low_state is False, "overall": True}
+                except Exception as e:
+                    return {"set_high": False, "set_low": False, "overall": False, "error": str(e)}
+
+            results = {
+                "Line1": _io_line_test(1),
+                "Line2": _io_line_test(2),
+                "UserOutput1": _user_output_test()
+            }
+
+            self.logger.info(f"IO test completed: {results}")
+            summary = self._format_io_results(results)
+            self.view.update_test_results("IO Test", summary)
+            return True
+        except Exception as e:
+            error_msg = f"IO test failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_power_cycle_test(self):
+        """Run power cycle test"""
+        try:
+            from funct.funct_powercycle import PowerCycleTest
+            
+            self.logger.info("Starting power cycle test")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Initialize test class
+            test = PowerCycleTest()
+            test.setup(self.camera_helper)
+            
+            # Run tests and get results
+            try:
+                results = test.test_power_cycle()
+                
+                # Log results
+                self.logger.info(f"Power cycle test completed: {results}")
+                
+                # Update view with results
+                summary = self._format_power_cycle_results(results)
+                self.view.update_test_results("Power Cycle Test", summary)
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Power cycle test execution failed: {str(e)}"
+                self.logger.error(error_msg)
+                self.view.show_error("Test Error", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to initialize power cycle test: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_init_cam_test(self):
+        """Run camera initialization test (adapted to functional pytest test)"""
+        import time
+        try:
+            self.logger.info("Starting camera initialization test (functional mode)")
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+
+            start = time.time()
+            cam = self.camera_helper.camera
+            if not cam.IsOpen():
+                raise RuntimeError("Camera not open")
+
+            grab = cam.GrabOne(500)
+            ok = grab and grab.GrabSucceeded()
+            if grab:
+                grab.Release()
+            elapsed = time.time() - start
+            if not ok:
+                raise RuntimeError("Failed to grab test frame during initialization")
+            if elapsed < 0:
+                raise RuntimeError("Invalid timing captured")
+
+            results = {"success": True, "elapsed": elapsed}
+            self.logger.info(f"Camera initialization test completed: {results}")
+            summary = self._format_init_cam_results(results)
+            self.view.update_test_results("Camera Initialization Test", summary)
+            return True
+        except Exception as e:
+            error_msg = f"Camera initialization test failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
+    def run_performance_tests(self):
+        """Run performance tests"""
+        try:
+            self.logger.info("Starting performance tests")
+            
+            # Verify camera is connected
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+            
+            # Run multiple performance tests
+            results = {}
+            
+            # Test 1: Max FPS
+            try:
+                from tests.test_maxFPS import TestMaxFPS
+                test = TestMaxFPS()
+                test.setup(self.camera_helper)
+                results['max_fps'] = test.test_maximum_fps()
+                self.logger.info("Max FPS test completed")
+            except Exception as e:
+                self.logger.warning(f"Max FPS test failed: {str(e)}")
+                results['max_fps'] = {'error': str(e)}
+            
+            # Test 2: Image Quality
+            try:
+                from tests.test_imgQuality import TestImageQuality
+                test = TestImageQuality()
+                test.setup(self.camera_helper)
+                results['image_quality'] = test.test_image_quality()
+                self.logger.info("Image quality test completed")
+            except Exception as e:
+                self.logger.warning(f"Image quality test failed: {str(e)}")
+                results['image_quality'] = {'error': str(e)}
+            
+            # Test 3: Long Run
+            try:
+                from funct.funct_longRun import LongRunTest
+                test = LongRunTest()
+                test.set_camera(self.camera_helper)
+                test.set_duration(10)  # Short test for performance
+                results['long_run'] = test.start_test()
+                self.logger.info("Long run test completed")
+            except Exception as e:
+                self.logger.warning(f"Long run test failed: {str(e)}")
+                results['long_run'] = {'error': str(e)}
+            
+            # Log overall results
+            self.logger.info(f"Performance tests completed: {results}")
+            
+            # Update view with results
+            summary = self._format_performance_results(results)
+            self.view.update_test_results("Performance Tests", summary)
+            
+            return True
+            
+        except Exception as e:
+            error_msg = f"Performance tests failed: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
     def _format_test_results(self, results):
         """Format test results into a readable summary with improved formatting"""
         summary = []
@@ -616,5 +1329,203 @@ class CameraPresenter:
         summary.append(f"Read Tests:  {read_success}/{read_total} successful")
         summary.append(f"Write Tests: {write_success}/{write_total} successful")
         summary.append(f"Overall:     {read_success + write_success}/{read_total + write_total} successful")
+        
+        return "\n".join(summary)
+
+    def _format_image_acquisition_results(self, results):
+        """Format image acquisition test results"""
+        summary = []
+        summary.append("=== Image Acquisition Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            summary.append(f"Total Frames: {results.get('total_frames', 'N/A')}")
+            summary.append(f"Successful Frames: {results.get('successful_frames', 'N/A')}")
+            summary.append(f"Failed Frames: {results.get('failed_frames', 'N/A')}")
+            summary.append(f"Success Rate: {results.get('success_rate', 'N/A'):.2f}%")
+            summary.append(f"Average FPS: {results.get('average_fps', 'N/A'):.2f}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_max_fps_results(self, results):
+        """Format max FPS test results"""
+        summary = []
+        summary.append("=== Max FPS Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            for test_name, test_results in results.items():
+                if isinstance(test_results, dict):
+                    summary.append(f"\n{test_name}:")
+                    summary.append(f"  FPS Achieved: {test_results.get('fps_achieved', 'N/A'):.2f}")
+                    summary.append(f"  Frames Captured: {test_results.get('frames_captured', 'N/A')}")
+                    summary.append(f"  Duration: {test_results.get('duration', 'N/A'):.2f}s")
+                    summary.append(f"  Exposure Time: {test_results.get('exposure_time', 'N/A')}μs")
+                else:
+                    summary.append(f"{test_name}: {test_results}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_roi_results(self, results):
+        """Format ROI test results"""
+        summary = []
+        summary.append("=== ROI Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            for test_name, test_results in results.items():
+                if isinstance(test_results, dict):
+                    summary.append(f"\n{test_name}:")
+                    summary.append(f"  Success: {test_results.get('success', 'N/A')}")
+                    summary.append(f"  Width: {test_results.get('width', 'N/A')}")
+                    summary.append(f"  Height: {test_results.get('height', 'N/A')}")
+                    summary.append(f"  Matches Expected: {test_results.get('matches_expected', 'N/A')}")
+                else:
+                    summary.append(f"{test_name}: {test_results}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_multicam_results(self, results):
+        """Format multi-camera test results"""
+        summary = []
+        summary.append("=== Multi-Camera Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            summary.append(f"Overall Success: {results.get('overall_success', 'N/A')}")
+            summary.append(f"Frame Counts: {results.get('frame_counts', 'N/A')}")
+            summary.append(f"FPS Values: {results.get('fps_values', 'N/A')}")
+            
+            sync_accuracy = results.get('sync_accuracy', {})
+            if sync_accuracy:
+                summary.append(f"Max Sync Error: {sync_accuracy.get('max_error', 'N/A'):.2f}μs")
+                summary.append(f"Avg Sync Error: {sync_accuracy.get('avg_error', 'N/A'):.2f}μs")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_power_gige_results(self, results):
+        """Format power GigE test results"""
+        summary = []
+        summary.append("=== Power GigE Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            summary.append(f"Success: {results.get('success', 'N/A')}")
+            summary.append(f"Test Duration: {results.get('test_duration', 'N/A'):.2f}s")
+            summary.append(f"Average Power: {results.get('average_power', 'N/A'):.2f}W")
+            summary.append(f"Peak Power: {results.get('peak_power', 'N/A'):.2f}W")
+            
+            if 'error' in results:
+                summary.append(f"Error: {results['error']}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_power_usb_results(self, results):
+        """Format power USB test results"""
+        summary = []
+        summary.append("=== Power USB Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            summary.append(f"Success: {results.get('success', 'N/A')}")
+            summary.append(f"Test Duration: {results.get('test_duration', 'N/A'):.2f}s")
+            summary.append(f"Average Current: {results.get('average_current', 'N/A'):.2f}mA")
+            summary.append(f"Peak Current: {results.get('peak_current', 'N/A'):.2f}mA")
+            summary.append(f"Average Power: {results.get('average_power', 'N/A'):.2f}W")
+            summary.append(f"Peak Power: {results.get('peak_power', 'N/A'):.2f}W")
+            
+            if 'error' in results:
+                summary.append(f"Error: {results['error']}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_io_results(self, results):
+        """Format IO test results"""
+        summary = []
+        summary.append("=== IO Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            for test_name, test_results in results.items():
+                if isinstance(test_results, dict):
+                    summary.append(f"\n{test_name}:")
+                    summary.append(f"  Input Test: {test_results.get('input_test', 'N/A')}")
+                    summary.append(f"  Output High: {test_results.get('output_high', 'N/A')}")
+                    summary.append(f"  Output Low: {test_results.get('output_low', 'N/A')}")
+                    summary.append(f"  Overall: {test_results.get('overall', 'N/A')}")
+                    
+                    if 'error' in test_results:
+                        summary.append(f"  Error: {test_results['error']}")
+                else:
+                    summary.append(f"{test_name}: {test_results}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_power_cycle_results(self, results):
+        """Format power cycle test results"""
+        summary = []
+        summary.append("=== Power Cycle Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            summary.append(f"Total Cycles: {results.get('total_cycles', 'N/A')}")
+            summary.append(f"Successful Cycles: {results.get('successful_cycles', 'N/A')}")
+            summary.append(f"Failed Cycles: {results.get('failed_cycles', 'N/A')}")
+            summary.append(f"Success Rate: {results.get('success_rate', 'N/A'):.2f}%")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_init_cam_results(self, results):
+        """Format camera initialization test results"""
+        summary = []
+        summary.append("=== Camera Initialization Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            summary.append(f"Success: {results.get('success', 'N/A')}")
+            summary.append(f"Error: {results.get('error', 'N/A')}")
+        else:
+            summary.append(f"Results: {results}")
+        
+        return "\n".join(summary)
+
+    def _format_performance_results(self, results):
+        """Format performance test results"""
+        summary = []
+        summary.append("=== Performance Test Results ===")
+        summary.append(f"Test Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        if isinstance(results, dict):
+            for test_name, test_results in results.items():
+                summary.append(f"\n{test_name.upper().replace('_', ' ')}:")
+                if isinstance(test_results, dict):
+                    if 'error' in test_results:
+                        summary.append(f"  Status: FAILED")
+                        summary.append(f"  Error: {test_results['error']}")
+                    else:
+                        summary.append(f"  Status: COMPLETED")
+                        for key, value in test_results.items():
+                            if key != 'error':
+                                summary.append(f"  {key.replace('_', ' ').title()}: {value}")
+                else:
+                    summary.append(f"  Results: {test_results}")
+        else:
+            summary.append(f"Results: {results}")
         
         return "\n".join(summary)
