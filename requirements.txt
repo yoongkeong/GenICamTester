@@ -9,3 +9,5 @@ pillow
 matplotlib
 typing-extensions
 requests
+psutil
+wmi

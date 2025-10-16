@@ -1,6 +1,7 @@
 # main_gui.py
 
 import sys, time
+import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QStackedWidget, QDialog, QLineEdit, QDialogButtonBox, QFormLayout, 
@@ -427,7 +428,43 @@ class CameraTestGUI(QMainWindow):
         """)
         self.status_layout.addWidget(self.progress_bar)
 
-        # Success widget
+        # Network configuration and system devices panel (PC info only)
+        net_group = QGroupBox("Network Configuration")
+        net_layout = QVBoxLayout()
+        helper_label = QLabel(
+            "View your PC's current devices. Use these to verify USB and GigE environments."
+        )
+        helper_label.setWordWrap(True)
+        net_layout.addWidget(helper_label)
+
+        # Action buttons row
+        btn_row = QHBoxLayout()
+        self.btn_show_usb = QPushButton("Device Manager (USB)")
+        self.btn_show_usb.setToolTip("List USB devices similar to Windows Device Manager")
+        self.btn_show_usb.clicked.connect(self.show_device_manager_usb)
+        btn_row.addWidget(self.btn_show_usb)
+
+        self.btn_show_net = QPushButton("Network Adapters")
+        self.btn_show_net.setToolTip("List network adapters and IPv4 addresses")
+        self.btn_show_net.clicked.connect(self.show_network_adapters_info)
+        btn_row.addWidget(self.btn_show_net)
+
+        btn_row.addStretch()
+        net_layout.addLayout(btn_row)
+
+        # Output area
+        self.pc_info_text = QTextEdit()
+        self.pc_info_text.setReadOnly(True)
+        self.pc_info_text.setMinimumHeight(140)
+        self.pc_info_text.setStyleSheet("QTextEdit { font-family: 'Consolas', 'Courier New', monospace; }")
+        self.pc_info_text.setPlainText(
+            "Click the buttons above to load USB or Network adapter information from this PC."
+        )
+        net_layout.addWidget(self.pc_info_text)
+
+        net_group.setLayout(net_layout)
+        layout.addWidget(net_group)
+        # Success widget (status + summary)
         self.success_widget = QWidget()
         self.success_widget.setVisible(False)
         success_layout = QVBoxLayout(self.success_widget)
@@ -456,8 +493,11 @@ class CameraTestGUI(QMainWindow):
         self.camera_summary.setAlignment(Qt.AlignCenter)
         self.camera_summary.setWordWrap(True)
         success_layout.addWidget(self.camera_summary)
-        # Proceed button (remain manual to satisfy user preference: no auto-run)
+
+        # Proceed button: always visible but disabled until a camera is connected
         self.proceed_button = QPushButton("Proceed to Tests")
+        self.proceed_button.setEnabled(False)
+        self.proceed_button.setToolTip("Connect a camera to proceed to tests")
         self.proceed_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {self.style_dict['success']};
@@ -470,16 +510,85 @@ class CameraTestGUI(QMainWindow):
                 margin: 20px 0;
                 min-width: 200px;
             }}
-            QPushButton:hover {{
+            QPushButton:disabled {{
+                background-color: #9e9e9e;
+                color: #f0f0f0;
+            }}
+            QPushButton:hover:!disabled {{
                 background-color: #45a049;
             }}
         """)
         self.proceed_button.clicked.connect(lambda: self.stacked_widget.setCurrentWidget(self.test_selection_page))
-        success_layout.addWidget(self.proceed_button)
+
+        # Order: status container -> success widget -> proceed button; button is outside success widget so it stays visible
         self.status_layout.addWidget(self.success_widget)
+        self.status_layout.addWidget(self.proceed_button, alignment=Qt.AlignCenter)
+
         layout.addWidget(self.status_container)
         layout.addStretch()
         self.stacked_widget.addWidget(self.camera_detection_page)
+        # Initialize system info panel with guidance text only (no default IPs)
+        try:
+            self.update_network_info()
+        except Exception:
+            pass
+
+    def update_network_info(self):
+        """Do not show default camera IPs; leave guidance text in the panel."""
+        if hasattr(self, 'pc_info_text') and self.pc_info_text:
+            # Keep existing text; nothing to auto-populate here.
+            return
+
+    def _run_powershell(self, command: str) -> str:
+        """Run a PowerShell command and return stdout or error text."""
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if completed.returncode == 0:
+                return completed.stdout.strip() or "(no output)"
+            else:
+                err = completed.stderr.strip()
+                return f"Error ({completed.returncode}): {err or completed.stdout.strip()}"
+        except Exception as e:
+            return f"Failed to run PowerShell: {e}"
+
+    def show_device_manager_usb(self):
+        """Display USB-related devices similar to Device Manager."""
+        cmd = (
+            "Get-PnpDevice -Class USB,USBHub | "
+            "Select-Object Status,Class,Present,Problem,ProblemStatus, FriendlyName,InstanceId | "
+            "Format-Table -AutoSize | Out-String"
+        )
+        output = self._run_powershell(cmd)
+        if hasattr(self, 'pc_info_text'):
+            self.pc_info_text.setPlainText(output)
+        self.log_message("Loaded USB devices from system", "INFO")
+
+    def show_network_adapters_info(self):
+        """Display network adapter information and IPv4 addresses."""
+        cmd_adapters = (
+            "Get-NetAdapter | "
+            "Select-Object Name, InterfaceDescription, Status, MacAddress, LinkSpeed | "
+            "Format-Table -AutoSize | Out-String"
+        )
+        cmd_ips = (
+            "Get-NetIPAddress -AddressFamily IPv4 | "
+            "Select-Object InterfaceAlias,IPAddress,PrefixLength | "
+            "Format-Table -AutoSize | Out-String"
+        )
+        adapters = self._run_powershell(cmd_adapters)
+        ips = self._run_powershell(cmd_ips)
+        combined = (
+            "Network Adapters:\n" + adapters.strip() +
+            "\n\nIPv4 Addresses:\n" + ips.strip()
+        )
+        if hasattr(self, 'pc_info_text'):
+            self.pc_info_text.setPlainText(combined)
+        self.log_message("Loaded Network adapter info from system", "INFO")
         
     def update_camera_detection_status(self, status, message, description="", show_progress=False, progress_value=0):
         """Update the camera detection status display"""
@@ -491,6 +600,8 @@ class CameraTestGUI(QMainWindow):
             if show_progress:
                 self.progress_bar.setValue(progress_value)
             self.success_widget.setVisible(False)
+            self.proceed_button.setEnabled(False)
+            self.proceed_button.setToolTip("Connect a camera to proceed to tests")
             
         elif status == "success":
             self.status_icon.setText("✅")
@@ -498,6 +609,13 @@ class CameraTestGUI(QMainWindow):
             self.status_description.setText(message)
             self.progress_bar.setVisible(False)
             self.success_widget.setVisible(True)
+            self.proceed_button.setEnabled(True)
+            self.proceed_button.setToolTip("")
+            # Refresh network info in case mode changed or IP resolved from device
+            try:
+                self.update_network_info()
+            except Exception:
+                pass
             
         elif status == "error":
             self.status_icon.setText("❌")
@@ -505,6 +623,8 @@ class CameraTestGUI(QMainWindow):
             self.status_description.setText(message)
             self.progress_bar.setVisible(False)
             self.success_widget.setVisible(False)
+            self.proceed_button.setEnabled(False)
+            self.proceed_button.setToolTip("Connect a camera to proceed to tests")
             
         elif status == "warning":
             self.status_icon.setText("⚠️")
@@ -512,6 +632,8 @@ class CameraTestGUI(QMainWindow):
             self.status_description.setText(message)
             self.progress_bar.setVisible(False)
             self.success_widget.setVisible(False)
+            self.proceed_button.setEnabled(False)
+            self.proceed_button.setToolTip("Connect a camera to proceed to tests")
             
         elif status == "ready":
             self.status_icon.setText("🔍")
@@ -519,6 +641,8 @@ class CameraTestGUI(QMainWindow):
             self.status_description.setText("Click one of the detection buttons above to begin")
             self.progress_bar.setVisible(False)
             self.success_widget.setVisible(False)
+            self.proceed_button.setEnabled(False)
+            self.proceed_button.setToolTip("Connect a camera to proceed to tests")
             
     def update_camera_summary(self, camera_info):
         """Update the camera summary display in the success state"""
@@ -532,7 +656,21 @@ class CameraTestGUI(QMainWindow):
             self.camera_summary.setText(summary_text)
 
     def prompt_gige_configuration(self):
-        config_dialog = CameraConfigDialog(self)
+        # Prefill dialog with helper defaults if available
+        defaults = {}
+        try:
+            if hasattr(self.presenter, 'camera_helper') and self.presenter.camera_helper:
+                info = self.presenter.camera_helper.get_network_info()
+                # Use stored defaults even if camera not connected
+                defaults = {
+                    'ip_address': getattr(self.presenter.camera_helper, 'ip_address', info.get('ip_address', '')),
+                    'subnet_mask': getattr(self.presenter.camera_helper, 'subnet_mask', info.get('subnet_mask', '')),
+                    'gateway': getattr(self.presenter.camera_helper, 'gateway', info.get('gateway', '')),
+                }
+        except Exception:
+            pass
+
+        config_dialog = CameraConfigDialog(self, defaults=defaults)
         if config_dialog.exec_() == QDialog.Accepted:
             use_dhcp, ip_settings = config_dialog.get_configuration()
             self.presenter.detect_gige_camera(use_dhcp, ip_settings)
@@ -557,6 +695,11 @@ class CameraTestGUI(QMainWindow):
                         # Hide success widget if it was left from a previous physical detection
                         if hasattr(self, 'success_widget'):
                             self.success_widget.setVisible(False)
+                        # Refresh network info to show Simulation mode
+                        try:
+                            self.update_network_info()
+                        except Exception:
+                            pass
                         # Ensure test selection page exists
                         if not hasattr(self, 'test_selection_page'):
                             try:
@@ -578,6 +721,10 @@ class CameraTestGUI(QMainWindow):
                     self.success_widget.setVisible(False)
                 self.update_camera_detection_status("ready", "Simulation disabled. Select an interface to detect cameras.")
                 self.log_message("Simulation mode disabled.", "INFO")
+                try:
+                    self.update_network_info()
+                except Exception:
+                    pass
         except Exception as e:
             self.log_message(f"Simulation toggle error: {e}", "ERROR")
 
@@ -1231,7 +1378,7 @@ class CameraTestGUI(QMainWindow):
             return None
 
 class CameraConfigDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, defaults: dict = None):
         super().__init__(parent)
         self.setWindowTitle("GigE Camera Configuration")
         
@@ -1257,7 +1404,14 @@ class CameraConfigDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         self.form_layout.addRow(self.buttons)
 
-        self.use_dhcp = True
+        # Default to manual unless DHCP is explicitly chosen
+        self.use_dhcp = False
+
+        # Prefill fields if defaults are provided
+        if defaults:
+            self.ip_address.setText(defaults.get('ip_address', ''))
+            self.subnet_mask.setText(defaults.get('subnet_mask', ''))
+            self.gateway.setText(defaults.get('gateway', ''))
 
     def accept_dhcp(self):
         self.use_dhcp = True

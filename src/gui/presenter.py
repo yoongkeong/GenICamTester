@@ -47,6 +47,14 @@ class CameraPresenter:
     def set_camera_helper(self, helper):
         self.camera_helper = helper
         self.logger.info("Camera helper set")
+        # Log active network configuration at the moment helper is set
+        try:
+            info = self.camera_helper.get_network_info()
+            self.logger.info(
+                f"Active network configuration → IP {info.get('ip_address')} / {info.get('subnet_mask')} / {info.get('gateway')} (mode={info.get('mode')})"
+            )
+        except Exception:
+            pass
 
     def set_driver_helper(self, helper):
         self.driver_helper = helper
@@ -239,6 +247,17 @@ class CameraPresenter:
     def detect_usb_camera(self):
         """Detect and connect to a USB camera"""
         try:
+            # If camera is already connected/open, avoid re-detection that can cause exclusive-open errors
+            try:
+                if self.camera_helper and self.camera_helper.camera and self.camera_helper.camera.IsOpen():
+                    self.logger.info("Camera already connected; skipping USB detection")
+                    self.view.update_camera_detection_status("success", "Camera already connected. You can proceed to tests.")
+                    self.view.log_message("Camera already connected; skipping USB detection", "INFO")
+                    return
+            except Exception:
+                # If any attribute missing or IsOpen raises, continue with detection
+                pass
+
             self.logger.info("Starting USB camera discovery...")
             self.view.update_camera_detection_status("detecting", "Searching for USB cameras...", show_progress=True, progress_value=25)
             
@@ -325,7 +344,7 @@ class CameraPresenter:
                 if ip_settings and 'ip_address' in ip_settings:
                     try:
                         # Allow helper to accept IP-based connection (simulation will always succeed)
-                        self.camera = self.camera_helper.connect_camera(None, ip_address=ip_settings['ip_address'])
+                        self.camera = self.camera_helper.connect_camera(ip_settings['ip_address'])
                         self.view.update_camera_detection_status("success", f"GigE camera connected to {ip_settings['ip_address']}")
                         # Create a dummy camera info for display
                         camera_info = {
@@ -725,6 +744,48 @@ class CameraPresenter:
             self.view.show_error("Test Error", error_msg)
             return False
 
+    def run_image_quality_tests(self):
+        """Run image quality tests"""
+        try:
+            from tests.test_imgQuality import TestImageQuality
+
+            self.logger.info("Starting image quality tests")
+
+            if not self.camera_helper or not self.camera_helper.camera:
+                raise RuntimeError("Camera not connected")
+
+            test = TestImageQuality()
+            test.setup(self.camera_helper)
+
+            results = test.test_image_quality()
+            if not results.get("success"):
+                raise RuntimeError(results.get("error", "Image quality test failed"))
+
+            # Format results for display
+            lines = ["Image Quality Metrics:"]
+            metrics = results.get("results", {})
+            for k, v in metrics.items():
+                val = v.get("value")
+                passed = v.get("pass")
+                thresh = v.get("threshold")
+                if thresh is not None:
+                    lines.append(f"- {k}: {val:.4g} (pass={passed}, threshold={thresh})")
+                else:
+                    try:
+                        lines.append(f"- {k}: {val:.4g} (pass={passed})")
+                    except Exception:
+                        lines.append(f"- {k}: {val} (pass={passed})")
+
+            summary = "\n".join(lines)
+            self.view.update_test_results("Image Quality", summary)
+            return True
+
+        except Exception as e:
+            error_msg = f"Failed to run image quality tests: {str(e)}"
+            self.logger.error(error_msg)
+            self.view.show_error("Test Error", error_msg)
+            return False
+
     def run_max_fps_test(self):
         """Run max FPS test"""
         try:
@@ -783,6 +844,13 @@ class CameraPresenter:
                 raise RuntimeError("GenICam helper not available")
 
             cam = self.camera_helper.camera
+
+            # Ensure helper has the camera attached
+            try:
+                if getattr(self.genicam_helper, 'camera', None) is None:
+                    self.genicam_helper.set_camera(cam)
+            except Exception:
+                pass
 
             # Helper to grab a single frame
             def _grab_one():
@@ -1323,7 +1391,21 @@ class CameraPresenter:
         summary.append("\n=== Test Summary ===")
         read_success = sum(1 for _, d in results["readability_test"].items() if d['readable'])
         read_total = len(results["readability_test"])
-        write_success = sum(1 for _, r in results["write_test"].items() if r.get('success', r) if r)
+        # Count successful write tests robustly across different value types
+        write_success = 0
+        for _, r in results["write_test"].items():
+            try:
+                if isinstance(r, dict):
+                    if r.get('success', False):
+                        write_success += 1
+                elif isinstance(r, bool):
+                    if r:
+                        write_success += 1
+                else:
+                    # Treat "Not Supported" or other non-bool as not successful but do not crash
+                    pass
+            except Exception:
+                pass
         write_total = len(results["write_test"])
         
         summary.append(f"Read Tests:  {read_success}/{read_total} successful")

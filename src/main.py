@@ -64,6 +64,18 @@ def main():
         gui.presenter.set_genicam_helper(genicam_helper)
         logger.info("Helpers set in presenter successfully")
 
+        # Reflect default network configuration in GUI and logs immediately
+        try:
+            if hasattr(gui, 'update_network_info'):
+                gui.update_network_info()
+            net = camera_helper.get_network_info()
+            mode = net.get('mode')
+            logger.info(
+                f"Active network configuration → IP {net.get('ip_address')} / {net.get('subnet_mask')} / {net.get('gateway')} (mode={mode})"
+            )
+        except Exception:
+            pass
+
         # Initialize functional modules
         blur_detection = BlurDetection()
         camera_calibration = CameraCalibration()
