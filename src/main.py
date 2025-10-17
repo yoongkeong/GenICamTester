@@ -26,13 +26,15 @@ from funct.funct_powercycle import PowerCycleTest
 from lib.camera_helper import CameraHelper
 from lib.driver_helper import DriverHelper
 from lib.genicam_helper import GenICamHelper
-from tests.test_featureAccess import TestFeatureAccess
-from tests.test_imageAcq import TestImageAcquisition
-from tests.test_imgQuality import TestImageQuality
-from tests.test_maxFPS import TestMaxFPS
-from tests.test_multicam import TestMultiCam
-from tests.test_powerGigE import TestPowerGigE
-from tests.test_powerUSB import TestPowerUSB
+# Make test imports optional — some test modules import optional libs that may not be available
+# Attempt to import test classes lazily later in main() to avoid failing at module import time
+# from tests.test_featureAccess import TestFeatureAccess
+# from tests.test_imageAcq import TestImageAcquisition
+# from tests.test_imgQuality import TestImageQuality
+# from tests.test_maxFPS import TestMaxFPS
+# from tests.test_multicam import TestMultiCam
+# from tests.test_powerGigE import TestPowerGigE
+# from tests.test_powerUSB import TestPowerUSB
 
 def main():
     try:
@@ -85,16 +87,33 @@ def main():
         logger.info("Functional modules initialized successfully")
 
         # Initialize test modules
-        test_feature_access = TestFeatureAccess()
-        test_image_acq = TestImageAcquisition()
-        test_img_quality = TestImageQuality()
-    # Note: Initialization & IO tests converted to internal functional implementations
-    # in presenter (no longer class-based), so we skip creating test objects here.
-        test_max_fps = TestMaxFPS()
-        test_multicam = TestMultiCam()
-        test_power_gige = TestPowerGigE()
-        test_power_usb = TestPowerUSB()
-        logger.info("Test modules initialized successfully")
+        test_feature_access = None
+        test_image_acq = None
+        test_img_quality = None
+        test_max_fps = None
+        test_multicam = None
+        test_power_gige = None
+        test_power_usb = None
+
+        try:
+            from tests.test_featureAccess import TestFeatureAccess
+            from tests.test_imageAcq import TestImageAcquisition
+            from tests.test_imgQuality import TestImageQuality
+            from tests.test_maxFPS import TestMaxFPS
+            from tests.test_multicam import TestMultiCam
+            from tests.test_powerGigE import TestPowerGigE
+            from tests.test_powerUSB import TestPowerUSB
+
+            test_feature_access = TestFeatureAccess()
+            test_image_acq = TestImageAcquisition()
+            test_img_quality = TestImageQuality()
+            test_max_fps = TestMaxFPS()
+            test_multicam = TestMultiCam()
+            test_power_gige = TestPowerGigE()
+            test_power_usb = TestPowerUSB()
+            logger.info("Test modules initialized successfully")
+        except ModuleNotFoundError as e:
+            logger.warning(f"Optional test module not found: {e.name}. Skipping related tests.")
 
         # Link GUI actions with functionality
         gui.presenter.add_functionality("blur_detection", blur_detection)

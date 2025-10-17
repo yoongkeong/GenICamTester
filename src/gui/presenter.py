@@ -30,6 +30,8 @@ class CameraPresenter:
         self.test_start_time = None
         self._last_frame_log_time = 0
         self._frames_since_last_log = 0
+        # Store last explicitly captured frame for GUI preview/save
+        self.last_captured_frame = None
         self._init_logging()
 
     def _init_logging(self):
@@ -212,37 +214,123 @@ class CameraPresenter:
             return None
 
     def snap_image(self):
-        """Capture a single image from the camera"""
+        """Capture a single image from the camera and store it for preview/save."""
         try:
             self.logger.info("Capturing single image")
-            
+
             if not self.camera_helper or not self.camera_helper.camera:
                 raise RuntimeError("Camera not connected")
-            
-            # Capture image
-            frame = self.get_current_frame()
+
+            cam = self.camera_helper.camera
+            frame = None
+
+            # Try direct single-frame grab using GrabOne (works without live view)
+            try:
+                if hasattr(cam, 'GrabOne'):
+                    self.logger.debug("Attempting GrabOne() for single image capture")
+                    grab = cam.GrabOne(1000)
+                    if grab and hasattr(grab, 'GrabSucceeded') and grab.GrabSucceeded():
+                        frame = grab.Array
+                    try:
+                        if grab is not None:
+                            grab.Release()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.logger.debug(f"GrabOne failed: {e}")
+
+            # Fallback: try helper's get_frame
+            if frame is None:
+                try:
+                    self.logger.debug("Falling back to camera_helper.get_frame()")
+                    frame = self.camera_helper.get_frame(self.camera)
+                except Exception as e:
+                    self.logger.debug(f"camera_helper.get_frame failed: {e}")
+
+            # If still no frame, attempt a software trigger (GenICam) if supported
+            if frame is None and getattr(self, 'genicam_helper', None) is not None:
+                try:
+                    gh = self.genicam_helper
+                    # Ensure helper has camera attached
+                    try:
+                        if getattr(gh, 'camera', None) is None:
+                            gh.set_camera(self.camera_helper.camera)
+                    except Exception:
+                        pass
+
+                    # Configure trigger to software and execute
+                    if gh.has_node('TriggerMode') and gh.has_node('TriggerSource'):
+                        try:
+                            gh.set_node_value('TriggerMode', 'On')
+                            gh.set_node_value('TriggerSource', 'Software')
+                        except Exception:
+                            # ignore failures to set
+                            pass
+
+                    # Execute software trigger command if available
+                    trig_node = gh._get_node('TriggerSoftware') if hasattr(gh, '_get_node') else None
+                    executed = False
+                    if trig_node is not None:
+                        for cmd in ('Execute', 'ExecuteCommand', 'Run'):
+                            try:
+                                if hasattr(trig_node, cmd):
+                                    getattr(trig_node, cmd)()
+                                    executed = True
+                                    break
+                            except Exception:
+                                continue
+
+                    # After triggering, try to GrabOne/RetrieveResult
+                    if executed:
+                        try:
+                            if hasattr(cam, 'RetrieveResult'):
+                                grab = cam.RetrieveResult(1000)
+                                if grab and hasattr(grab, 'GrabSucceeded') and grab.GrabSucceeded():
+                                    frame = grab.Array
+                                try:
+                                    if grab is not None:
+                                        grab.Release()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            try:
+                                grab = cam.GrabOne(1000)
+                                if grab and hasattr(grab, 'GrabSucceeded') and grab.GrabSucceeded():
+                                    frame = grab.Array
+                                try:
+                                    if grab is not None:
+                                        grab.Release()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                except Exception as e:
+                    self.logger.debug(f"Software trigger attempt failed: {e}")
+
             if frame is not None:
                 self.logger.info("Image captured successfully")
                 self.view.log_message("Image captured successfully", "SUCCESS")
-                
-                # Save image to file
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                filename = f"snap_image_{timestamp}.png"
-                cv2.imwrite(filename, frame)
-                self.logger.info(f"Image saved to {filename}")
-                self.view.log_message(f"Image saved to {filename}", "SUCCESS")
-                
-                return True
+                # Store for preview/save
+                self.last_captured_frame = frame
+                # Instruct view to display preview in the live view area
+                try:
+                    if hasattr(self.view, 'show_captured_image'):
+                        self.view.show_captured_image(frame)
+                except Exception:
+                    pass
+
+                return frame
             else:
                 self.logger.warning("Failed to capture image")
                 self.view.log_message("Failed to capture image", "WARNING")
-                return False
-                
+                return None
+
         except Exception as e:
             error_msg = f"Image capture failed: {str(e)}"
             self.logger.error(error_msg)
             self.view.log_message(error_msg, "ERROR")
-            return False
+            return None
 
     def detect_usb_camera(self):
         """Detect and connect to a USB camera"""

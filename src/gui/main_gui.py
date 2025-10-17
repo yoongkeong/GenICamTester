@@ -1138,6 +1138,53 @@ class CameraTestGUI(QMainWindow):
         """Capture a single image"""
         self.presenter.snap_image()
 
+    def show_captured_image(self, frame):
+        """Show captured frame in the live view area and prompt user to save."""
+        try:
+            # Convert BGR to RGB for display
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame_rgb.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
+            self.image_label.setPixmap(scaled_pixmap)
+
+            # Prompt user to save file (do not auto-save)
+            file_name, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save Captured Image",
+                "",
+                "PNG Image (*.png);;JPEG Image (*.jpg);;RAW Image (*.raw);;All Files (*)"
+            )
+
+            if file_name:
+                # Determine format from selected filter or extension
+                fmt = None
+                if selected_filter and "PNG" in selected_filter:
+                    fmt = 'png'
+                elif selected_filter and ("JPEG" in selected_filter or "JPG" in selected_filter):
+                    fmt = 'jpg'
+                elif selected_filter and "RAW" in selected_filter:
+                    fmt = 'raw'
+                else:
+                    # Use extension
+                    _, ext = os.path.splitext(file_name)
+                    fmt = ext.lstrip('.').lower() or 'png'
+
+                try:
+                    if fmt == 'raw':
+                        # Save raw bytes (BGR numpy array) to file
+                        frame.tofile(file_name)
+                    else:
+                        # Use OpenCV imwrite for common formats
+                        cv2.imwrite(file_name, frame)
+                    self.log_message(f"Captured image saved to {file_name}", "SUCCESS")
+                except Exception as e:
+                    self.show_error("Save Error", f"Failed to save image: {e}")
+        except Exception as e:
+            self.log_message(f"Failed to display captured image: {e}", "ERROR")
+
     def log_message(self, message, level="INFO"):
         """Add a message to the log viewer"""
         timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
