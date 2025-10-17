@@ -3,13 +3,13 @@
 import sys, time
 import subprocess
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-    QLabel, QStackedWidget, QDialog, QLineEdit, QDialogButtonBox, QFormLayout, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QStackedWidget, QDialog, QLineEdit, QDialogButtonBox, QFormLayout,
     QMessageBox, QGroupBox, QTextEdit, QProgressBar, QSpinBox, QSplitter, QFrame,
-    QFileDialog
+    QFileDialog, QSlider, QComboBox
 )
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import Qt, QTimer, QDateTime
+from PyQt5.QtGui import QImage, QPixmap, QPainter
+from PyQt5.QtCore import Qt, QTimer, QDateTime, QEvent, QPoint
 import cv2
 import numpy as np
 from .presenter import CameraPresenter
@@ -1424,6 +1424,16 @@ class CameraTestGUI(QMainWindow):
             self.show_error("Save Error", error_msg)
             return None
 
+    def show_camera_calibration_dialog(self, genicam_helper, camera_helper):
+        """Open the interactive Camera Calibration dialog and return True if accepted."""
+        try:
+            dlg = CameraCalibrationDialog(self, genicam_helper, camera_helper)
+            res = dlg.exec_()
+            return res == QDialog.Accepted
+        except Exception as e:
+            self.log_message(f"Failed to open calibration dialog: {e}", "ERROR")
+            return False
+
 class CameraConfigDialog(QDialog):
     def __init__(self, parent=None, defaults: dict = None):
         super().__init__(parent)
@@ -1553,7 +1563,6 @@ class LongRunTestDialog(QDialog):
         self.image_label = QLabel()
         self.image_label.setMinimumSize(400, 300)
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("QLabel { background-color: #000000; }")
         view_layout.addWidget(self.image_label)
         
         view_group.setLayout(view_layout)
@@ -1810,8 +1819,745 @@ class TestProgressDialog(QDialog):
         """Check if test was cancelled"""
         return self.is_cancelled
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    gui = CameraTestGUI()
-    gui.show()
-    sys.exit(app.exec_())
+class CameraCalibrationDialog(QDialog):
+    def __init__(self, parent, genicam_helper, camera_helper):
+        super().__init__(parent)
+        self.setWindowTitle("Camera Calibration - ISO12233 Matching")
+        self.setMinimumSize(1100, 750)
+        self.genicam_helper = genicam_helper
+        self.camera_helper = camera_helper
+        self.live_frame = None
+        self.captured_frame = None
+        self.chart_image = None
+        self._live_enabled = False
+        self._zoom = 1.0
+        self._pan_enabled = False
+        self._pan_offset = QPoint(0, 0)
+        self._mouse_last = None
+        self._load_chart()
+        self._build_ui()
+        # Ensure Start button and live placeholder are visible/enabled
+        try:
+            if hasattr(self, 'btn_start_capture'):
+                self.btn_start_capture.setVisible(True)
+                self.btn_start_capture.setEnabled(True)
+                try:
+                    self.parent().log_message('Start Calibration mode button present in dialog', 'INFO')
+                except Exception:
+                    pass
+            if hasattr(self, 'live_label'):
+                # make sure the placeholder text is visible
+                try:
+                    self.live_label.setText(self.live_label.text() or 'Live view (stopped)')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _load_chart(self):
+        # Try multiple locations to find the chart
+        candidates = [
+            os.path.abspath(os.path.join(os.getcwd(), 'data', 'calibration_files')),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'calibration_files')),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'calibration_files')),
+            os.path.abspath(os.path.join(os.getcwd(), '..', 'data', 'calibration_files')),
+        ]
+        fname_variants = ['ISO12233_Test chart.PNG', 'ISO12233_Test chart.png', 'ISO12233_Test_chart.PNG', 'ISO12233_Test_chart.png']
+        path = None
+        for base in candidates:
+            for fn in fname_variants:
+                p = os.path.join(base, fn)
+                if os.path.exists(p):
+                    path = p
+                    break
+            if path:
+                break
+        if not path:
+            try:
+                self.parent().log_message('ISO12233 chart not found; showing chart placeholder', 'WARNING')
+            except Exception:
+                pass
+            self.chart_image = None
+            return
+        img = cv2.imread(path)
+        if img is None:
+            try:
+                self.parent().log_message(f'Failed to load chart image at {path}', 'ERROR')
+            except Exception:
+                pass
+            self.chart_image = None
+            return
+        self.chart_image = img
+        try:
+            self.parent().log_message(f'Loaded calibration chart from {path}', 'INFO')
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        instr = QLabel(
+            "1) Place the printed ISO12233 chart in the camera FOV so it fills the frame.\n"
+            "2) Click 'Start calibration mode' to start the camera live view.\n"
+            "3) Use the live view controls to adjust exposure/gain/pixel format/white balance/gamma/offset/ROI.\n"
+            "4) Hover over the live image to see (x,y) and gray value. Use zoom/pan tools as needed.\n"
+            "5) Save configuration to camera or cancel."
+        )
+        instr.setWordWrap(True)
+        layout.addWidget(instr)
+
+        # Chart only initially; live preview hidden until Start
+        top = QHBoxLayout()
+        self.chart_label = QLabel()
+        self.chart_label.setFixedSize(500, 400)
+        if self.chart_image is not None:
+            self._set_label_image(self.chart_label, self.chart_image)
+        else:
+            self.chart_label.setText('ISO12233 chart not found')
+            self.chart_label.setAlignment(Qt.AlignCenter)
+        top.addWidget(self.chart_label)
+
+        # Right column for controls and live/toolbar
+        right_col = QVBoxLayout()
+
+        # Live view container (hidden until start)
+        self.live_container = QWidget()
+        live_layout = QVBoxLayout(self.live_container)
+        self.live_label = QLabel()
+        self.live_label.setFixedSize(640, 480)
+        self.live_label.setAlignment(Qt.AlignCenter)
+        self.live_label.setStyleSheet('background-color: black; border: 1px solid #333;')
+        self.live_label.setMouseTracking(True)
+        self.live_label.installEventFilter(self)
+        # Show placeholder text so live view area is visible even when not grabbing
+        self.live_label.setText('Live view (stopped)')
+        self.live_label.setStyleSheet('color: #cccccc; background-color: #000000; border: 1px solid #333; font-family: Consolas, monospace;')
+        live_layout.addWidget(self.live_label)
+
+        # Toolbar: Zoom In/Out, Pan toggle, Reset (Start button moved to configuration row)
+        toolbar = QHBoxLayout()
+        # NOTE: 'Start Calibration mode' button intentionally moved to the configuration
+        # button row (so it's beside Save/Cancel). Keep toolbar limited to view controls.
+
+        self.btn_zoom_in = QPushButton('Zoom +')
+        self.btn_zoom_in.clicked.connect(lambda: self._change_zoom(1.25))
+        toolbar.addWidget(self.btn_zoom_in)
+        self.btn_zoom_out = QPushButton('Zoom -')
+        self.btn_zoom_out.clicked.connect(lambda: self._change_zoom(0.8))
+        toolbar.addWidget(self.btn_zoom_out)
+        self.btn_pan = QPushButton('Pan')
+        self.btn_pan.setCheckable(True)
+        self.btn_pan.toggled.connect(self._toggle_pan)
+        toolbar.addWidget(self.btn_pan)
+        self.btn_reset = QPushButton('Reset View')
+        self.btn_reset.clicked.connect(self._reset_view)
+        toolbar.addWidget(self.btn_reset)
+
+        live_layout.addLayout(toolbar)
+
+        # Pixel info label
+        self.pixel_info = QLabel('x,y: -   gray: -')
+        live_layout.addWidget(self.pixel_info)
+
+        # Keep live container visible but controls disabled until Start pressed
+        self.live_container.setVisible(True)
+        right_col.addWidget(self.live_container)
+
+        # Initially disable live-control widgets until live preview is started
+        try:
+            self.exposure_slider.setEnabled(False)
+            self.exposure_spin.setEnabled(False)
+            self.gain_slider.setEnabled(False)
+            self.gain_spin.setEnabled(False)
+            self.wb_slider.setEnabled(False)
+            self.wb_spin.setEnabled(False)
+            self.gamma_slider.setEnabled(False)
+            self.gamma_spin.setEnabled(False)
+            self.pixfmt_combo.setEnabled(False)
+            self.offset_x_spin.setEnabled(False)
+            self.offset_y_spin.setEnabled(False)
+            self.roi_w_spin.setEnabled(False)
+            self.roi_h_spin.setEnabled(False)
+            self.btn_zoom_in.setEnabled(False)
+            self.btn_zoom_out.setEnabled(False)
+            self.btn_pan.setEnabled(False)
+            self.btn_reset.setEnabled(False)
+        except Exception:
+            pass
+        control_group = QGroupBox('Camera Settings (live control)')
+        control_layout = QVBoxLayout()
+
+        def add_slider_with_spin(label_text, slider, spinbox, on_slider_cb=None, on_spin_cb=None, spin_range=(0, 10000)):
+            row = QWidget()
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(0,0,0,0)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(120)
+            row_l.addWidget(lbl)
+            row_l.addWidget(slider)
+            spinbox.setRange(spin_range[0], spin_range[1])
+            spinbox.setFixedWidth(100)
+            row_l.addWidget(spinbox)
+            if on_slider_cb:
+                slider.valueChanged.connect(on_slider_cb)
+            if on_spin_cb:
+                spinbox.valueChanged.connect(on_spin_cb)
+            control_layout.addWidget(row)
+            return row
+
+        # Exposure
+        self.exposure_slider = QSlider(Qt.Horizontal)
+        self.exposure_slider.setMinimum(1)
+        self.exposure_slider.setMaximum(10000000)
+        self.exposure_spin = QSpinBox()
+        try:
+            cur = int(self.genicam_helper.get_exposure_time()) if hasattr(self.genicam_helper, 'get_exposure_time') else 1000
+        except Exception:
+            cur = 1000
+        self.exposure_slider.setValue(cur)
+        self.exposure_spin.setValue(cur)
+        add_slider_with_spin('ExposureTime:', self.exposure_slider, self.exposure_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.exposure_slider, self.exposure_spin, v, self._on_exposure_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.exposure_spin, self.exposure_slider, v, self._on_exposure_change),
+                             spin_range=(1, 10000000))
+
+        # Gain
+        self.gain_slider = QSlider(Qt.Horizontal)
+        self.gain_slider.setMinimum(0)
+        self.gain_slider.setMaximum(300)
+        self.gain_spin = QSpinBox()
+        try:
+            gcur = int(self.genicam_helper.get_gain()) if hasattr(self.genicam_helper, 'get_gain') else 0
+        except Exception:
+            gcur = 0
+        self.gain_slider.setValue(gcur)
+        self.gain_spin.setValue(gcur)
+        add_slider_with_spin('Gain:', self.gain_slider, self.gain_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.gain_slider, self.gain_spin, v, self._on_gain_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.gain_spin, self.gain_slider, v, self._on_gain_change),
+                             spin_range=(0, 300))
+
+        # White balance
+        self.wb_slider = QSlider(Qt.Horizontal)
+        self.wb_slider.setMinimum(0)
+        self.wb_slider.setMaximum(5000)
+        self.wb_spin = QSpinBox()
+        self.wb_spin.setValue(0)
+        add_slider_with_spin('WhiteBalance:', self.wb_slider, self.wb_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.wb_slider, self.wb_spin, v, self._on_white_balance_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.wb_spin, self.wb_slider, v, self._on_white_balance_change),
+                             spin_range=(0, 5000))
+
+        # Gamma (scaled by 100)
+        self.gamma_slider = QSlider(Qt.Horizontal)
+        self.gamma_slider.setMinimum(10)
+        self.gamma_slider.setMaximum(500)
+        self.gamma_spin = QSpinBox()
+        self.gamma_spin.setRange(10, 500)
+        self.gamma_spin.setValue(100)
+        add_slider_with_spin('Gamma(x0.01):', self.gamma_slider, self.gamma_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.gamma_slider, self.gamma_spin, v, self._on_gamma_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.gamma_spin, self.gamma_slider, v, self._on_gamma_change),
+                             spin_range=(10, 500))
+
+        # Pixel format combo (show current and allow selection)
+        pf_row = QWidget()
+        pf_layout = QHBoxLayout(pf_row)
+        pf_layout.setContentsMargins(0,0,0,0)
+        pf_label = QLabel('PixelFormat:')
+        pf_label.setFixedWidth(120)
+        self.pixfmt_combo = QComboBox()
+        try:
+            fmts = self.genicam_helper.get_available_pixel_formats() if hasattr(self.genicam_helper, 'get_available_pixel_formats') else []
+        except Exception:
+            fmts = []
+        self.pixfmt_combo.addItems(fmts)
+        pf_layout.addWidget(pf_label)
+        pf_layout.addWidget(self.pixfmt_combo)
+        control_layout.addWidget(pf_row)
+        self.pixfmt_combo.currentIndexChanged.connect(self._on_pixfmt_change)
+
+        # Offsets and ROI with spinboxes (no sliders)
+        off_row = QWidget()
+        off_layout = QHBoxLayout(off_row)
+        off_layout.setContentsMargins(0,0,0,0)
+        off_label = QLabel('OffsetX/OffsetY:')
+        off_label.setFixedWidth(120)
+        self.offset_x_spin = QSpinBox()
+        self.offset_y_spin = QSpinBox()
+        try:
+            mx, mh = self.genicam_helper.get_max_resolution() if hasattr(self.genicam_helper, 'get_max_resolution') else (10000,10000)
+            max_w = int(mx)
+            max_h = int(mh)
+        except Exception:
+            max_w = 10000
+            max_h = 10000
+        self.offset_x_spin.setRange(0, max_w)
+        self.offset_y_spin.setRange(0, max_h)
+        off_layout.addWidget(off_label)
+        off_layout.addWidget(self.offset_x_spin)
+        off_layout.addWidget(self.offset_y_spin)
+        control_layout.addWidget(off_row)
+        self.offset_x_spin.valueChanged.connect(self._on_offset_x_change)
+        self.offset_y_spin.valueChanged.connect(self._on_offset_y_change)
+
+        roi_row = QWidget()
+        roi_layout = QHBoxLayout(roi_row)
+        roi_layout.setContentsMargins(0,0,0,0)
+        roi_label = QLabel('ROI W/H:')
+        roi_label.setFixedWidth(120)
+        self.roi_w_spin = QSpinBox()
+        self.roi_h_spin = QSpinBox()
+        self.roi_w_spin.setRange(1, max_w)
+        self.roi_h_spin.setRange(1, max_h)
+        self.roi_w_spin.setValue(min(1920, max_w))
+        self.roi_h_spin.setValue(min(1080, max_h))
+        roi_layout.addWidget(roi_label)
+        roi_layout.addWidget(self.roi_w_spin)
+        roi_layout.addWidget(self.roi_h_spin)
+        control_layout.addWidget(roi_row)
+        self.roi_w_spin.valueChanged.connect(self._on_roi_change)
+        self.roi_h_spin.valueChanged.connect(self._on_roi_change)
+
+        control_group.setLayout(control_layout)
+        right_col.addWidget(control_group)
+
+        # Save / Start / Cancel row: Start button placed beside Save and Cancel
+        bottom_h = QHBoxLayout()
+
+        # Start Calibration Mode (moved here from the live toolbar)
+        self.btn_start_capture = QPushButton('Start Calibration mode')
+        try:
+            self.btn_start_capture.setMinimumWidth(180)
+            self.btn_start_capture.setStyleSheet(f"background-color: {self.style_dict['primary']}; color: {self.style_dict['white']}; padding: 8px; border-radius: 6px;")
+            self.btn_start_capture.setEnabled(True)
+        except Exception:
+            pass
+        self.btn_start_capture.clicked.connect(self._on_start_or_capture)
+        bottom_h.addWidget(self.btn_start_capture)
+
+        # Save configuration
+        self.btn_save_cfg = QPushButton('Save configuration to camera')
+        self.btn_save_cfg.clicked.connect(self._on_save_configuration)
+        self.btn_save_cfg.setEnabled(False)
+        bottom_h.addWidget(self.btn_save_cfg)
+
+        # Cancel / Back
+        self.btn_cancel = QPushButton('Do not save, back to main')
+        self.btn_cancel.clicked.connect(self.reject)
+        bottom_h.addWidget(self.btn_cancel)
+
+        # Keep spacing consistent with other dialogs
+        bottom_h.addStretch()
+        right_col.addLayout(bottom_h)
+
+        top.addLayout(right_col)
+        layout.addLayout(top)
+
+        self.setLayout(layout)
+
+        # Timer for live preview (not started until Start clicked)
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._update_live_preview)
+
+    # Utility helpers
+    def _sync_slider_spin(self, slider, spin, value, cb):
+        try:
+            spin.blockSignals(True)
+            spin.setValue(int(value))
+            spin.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            cb(value)
+        except Exception:
+            pass
+
+    def _sync_spin_slider(self, spin, slider, value, cb):
+        try:
+            slider.blockSignals(True)
+            slider.setValue(int(value))
+            slider.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            cb(value)
+        except Exception:
+            pass
+
+    def _on_start_or_capture(self):
+        # If not live, start live view; otherwise capture current frame
+        if not self._live_enabled:
+            # Start presenter live view so camera starts streaming
+            try:
+                if hasattr(self.parent(), 'presenter'):
+                    self.parent().presenter.start_live_view()
+            except Exception:
+                pass
+
+            self._live_enabled = True
+
+            # enable live controls
+            try:
+                self.exposure_slider.setEnabled(True)
+                self.exposure_spin.setEnabled(True)
+                self.gain_slider.setEnabled(True)
+                self.gain_spin.setEnabled(True)
+                self.wb_slider.setEnabled(True)
+                self.wb_spin.setEnabled(True)
+                self.gamma_slider.setEnabled(True)
+                self.gamma_spin.setEnabled(True)
+                self.pixfmt_combo.setEnabled(True)
+                self.offset_x_spin.setEnabled(True)
+                self.offset_y_spin.setEnabled(True)
+                self.roi_w_spin.setEnabled(True)
+                self.roi_h_spin.setEnabled(True)
+                self.btn_zoom_in.setEnabled(True)
+                self.btn_zoom_out.setEnabled(True)
+                self.btn_pan.setEnabled(True)
+                self.btn_reset.setEnabled(True)
+            except Exception:
+                pass
+
+            self._live_timer.start(100)
+            self.btn_start_capture.setText('Capture')
+            try:
+                self.parent().log_message('Live view started for calibration', 'INFO')
+            except Exception:
+                pass
+            return
+
+        # Already live -> Capture a frame
+        try:
+            frame = None
+            if hasattr(self.parent(), 'presenter'):
+                frame = self.parent().presenter.get_current_frame()
+            if frame is None and self.camera_helper:
+                try:
+                    frame = self.camera_helper.get_frame(self.camera_helper.camera, timeout_ms=1000)
+                except Exception:
+                    frame = None
+            if frame is None:
+                try:
+                    self.parent().log_message('Failed to capture image during calibration', 'ERROR')
+                except Exception:
+                    pass
+                return
+            # Store captured frame and show it briefly (no side-by-side)
+            self.captured_frame = frame
+            self._display_live_frame(frame)
+            self.btn_save_cfg.setEnabled(True)
+            try:
+                self.parent().log_message('Captured calibration image', 'INFO')
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f'Capture failed: {e}', 'ERROR')
+            except Exception:
+                pass
+
+    def _update_live_preview(self):
+        try:
+            frame = None
+            if hasattr(self.parent(), 'presenter'):
+                frame = self.parent().presenter.get_current_frame()
+            if frame is None and self.camera_helper:
+                frame = self.camera_helper.get_frame(self.camera_helper.camera, timeout_ms=200)
+            if frame is not None:
+                self.live_frame = frame
+                self._display_live_frame(frame)
+        except Exception as e:
+            try:
+                self.parent().log_message(f'Live preview error: {e}', 'WARNING')
+            except Exception:
+                pass
+
+    def _display_live_frame(self, frame):
+        # Render frame to live_label honoring zoom and pan
+        try:
+            img = frame.copy()
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
+            # Create QImage
+            bytes_per_line = 3 * w
+            qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg)
+            # Apply zoom
+            if self._zoom != 1.0:
+                pix = pix.scaled(int(pix.width() * self._zoom), int(pix.height() * self._zoom), Qt.KeepAspectRatio)
+            # Create canvas and draw at pan offset
+            canvas = QPixmap(self.live_label.size())
+            canvas.fill(Qt.black)
+            painter = QPainter(canvas)
+            # compute top-left based on pan offset
+            tx = self._pan_offset.x()
+            ty = self._pan_offset.y()
+            painter.drawPixmap(tx, ty, pix)
+            painter.end()
+            self.live_label.setPixmap(canvas)
+        except Exception:
+            try:
+                self.parent().log_message('Failed to display live frame', 'WARNING')
+            except Exception:
+                pass
+
+    def eventFilter(self, obj, event):
+        # Mouse movement on live_label -> show coordinates and gray value
+        if obj is self.live_label and event.type() == QEvent.MouseMove:
+            pos = event.pos()
+            self._handle_mouse_move(pos)
+            if self._pan_enabled and event.buttons() & Qt.LeftButton:
+                if self._mouse_last is not None:
+                    delta = pos - self._mouse_last
+                    self._pan_offset += delta
+                self._mouse_last = pos
+            return True
+        if obj is self.live_label and event.type() == QEvent.MouseButtonPress:
+            if self._pan_enabled and event.button() == Qt.LeftButton:
+                self._mouse_last = event.pos()
+                return True
+        if obj is self.live_label and event.type() == QEvent.MouseButtonRelease:
+            if self._pan_enabled and event.button() == Qt.LeftButton:
+                self._mouse_last = None
+                return True
+        return super().eventFilter(obj, event)
+
+    def _handle_mouse_move(self, pos):
+        try:
+            # Map label coordinates to the actual live_frame image coordinates
+            if self.live_frame is None:
+                return
+            img = self.live_frame
+            h, w = img.shape[:2]
+            lbl_w = self.live_label.width()
+            lbl_h = self.live_label.height()
+            # Determine scale used (we used KeepAspectRatio when drawing pixmap)
+            scale = min(lbl_w / (w * self._zoom), lbl_h / (h * self._zoom))
+            disp_w = int(w * self._zoom * scale)
+            disp_h = int(h * self._zoom * scale)
+            x_off = max(0, (lbl_w - disp_w) // 2 + self._pan_offset.x())
+            y_off = max(0, (lbl_h - disp_h) // 2 + self._pan_offset.y())
+            # compute image coordinates
+            ix = int((pos.x() - x_off) / (self._zoom * scale))
+            iy = int((pos.y() - y_off) / (self._zoom * scale))
+            if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                self.pixel_info.setText('x,y: -   gray: -')
+                return
+            # get gray value
+            gray = int(np.mean(img[iy, ix]))
+            self.pixel_info.setText(f'x,y: {ix},{iy}   gray: {gray}')
+        except Exception:
+            pass
+
+    def _change_zoom(self, factor):
+        try:
+            self._zoom = max(0.1, min(10.0, self._zoom * factor))
+            if self.live_frame is not None:
+                self._display_live_frame(self.live_frame)
+        except Exception:
+            pass
+
+    def _toggle_pan(self, on):
+        self._pan_enabled = bool(on)
+        if not on:
+            self._mouse_last = None
+
+    def _reset_view(self):
+        self._zoom = 1.0
+        self._pan_offset = QPoint(0,0)
+        if self.live_frame is not None:
+            self._display_live_frame(self.live_frame)
+
+    # ...existing settings handlers (use same names) ...
+    def _on_exposure_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_exposure_time'):
+                self.genicam_helper.set_exposure_time(float(val))
+                try:
+                    self.parent().log_message(f"Set ExposureTime to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set ExposureTime: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_gain_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_gain'):
+                self.genicam_helper.set_gain(float(val))
+                try:
+                    self.parent().log_message(f"Set Gain to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set Gain: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_white_balance_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_white_balance'):
+                self.genicam_helper.set_white_balance(float(val))
+                try:
+                    self.parent().log_message(f"Set WhiteBalance to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set WhiteBalance: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_gamma_change(self, val):
+        try:
+            gamma_val = float(val) / 100.0
+            if hasattr(self.genicam_helper, 'set_gamma'):
+                self.genicam_helper.set_gamma(float(gamma_val))
+                try:
+                    self.parent().log_message(f"Set Gamma to {gamma_val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set Gamma: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_pixfmt_change(self, idx):
+        try:
+            fmt = self.pixfmt_combo.currentText()
+            if fmt and hasattr(self.genicam_helper, 'set_pixel_format'):
+                self.genicam_helper.set_pixel_format(fmt)
+                try:
+                    self.parent().log_message(f"Set PixelFormat to {fmt}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set PixelFormat: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_offset_x_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_offset_x'):
+                self.genicam_helper.set_offset_x(int(val))
+                try:
+                    self.parent().log_message(f"Set OffsetX to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set OffsetX: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_offset_y_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_offset_y'):
+                self.genicam_helper.set_offset_y(int(val))
+                try:
+                    self.parent().log_message(f"Set OffsetY to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set OffsetY: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_roi_change(self):
+        try:
+            w = int(self.roi_w_spin.value())
+            h = int(self.roi_h_spin.value())
+            if hasattr(self.genicam_helper, 'set_roi'):
+                self.genicam_helper.set_roi(w, h)
+                try:
+                    self.parent().log_message(f"Set ROI to {w}x{h}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set ROI: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_save_configuration(self):
+        try:
+            if self.genicam_helper is None:
+                raise RuntimeError("GenICam helper not available")
+            try:
+                if self.genicam_helper.has_node('UserSetSelector') and self.genicam_helper.has_node('UserSetLoad'):
+                    try:
+                        self.genicam_helper.set_node_value('UserSetSelector', 1)
+                        save_node = self.genicam_helper._get_node('UserSetSave')
+                        if save_node is not None and hasattr(save_node, 'Execute'):
+                            save_node.Execute()
+                        elif hasattr(save_node, 'SetValue'):
+                            save_node.SetValue(1)
+                    except Exception as e:
+                        try:
+                            self.parent().log_message(f"Failed to write user setting via nodes: {e}", "WARNING")
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.parent().log_message("Camera does not support UserSet save via GenICam nodes; skipping actual save", "WARNING")
+                    except Exception:
+                        pass
+                try:
+                    self.parent().log_message("Configuration saved to camera (if supported)", "SUCCESS")
+                except Exception:
+                    pass
+                self.accept()
+            except Exception as e:
+                try:
+                    self.parent().log_message(f"Failed to save configuration: {e}", "ERROR")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Save configuration error: {e}", "ERROR")
+            except Exception:
+                pass
+
+    def show_modal(self):
+        return self.exec_()
+
+    def _set_label_image(self, label, frame):
+        try:
+            if frame is None:
+                label.clear()
+                return
+            # ensure BGR
+            img = frame
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            # Convert to RGB for Qt
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
+            bytes_per_line = 3 * w
+            qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(label.size(), Qt.KeepAspectRatio)
+            label.setPixmap(pix)
+        except Exception:
+            try:
+                self.parent().log_message('Failed to set label image', 'WARNING')
+            except Exception:
+                pass
+
+    def show_camera_calibration_dialog(self, genicam_helper, camera_helper):
+        """Factory to show CameraCalibrationDialog from the presenter."""
+        try:
+            dlg = CameraCalibrationDialog(self, genicam_helper, camera_helper)
+            res = dlg.exec_()
+            return res == QDialog.Accepted
+        except Exception as e:
+            self.log_message(f"Failed to open calibration dialog: {e}", "ERROR")
+            return False

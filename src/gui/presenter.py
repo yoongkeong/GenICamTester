@@ -1003,50 +1003,63 @@ class CameraPresenter:
             return False
 
     def run_camera_calibration(self):
-        """Run camera calibration"""
+        """Run camera calibration - construct and show the calibration dialog directly."""
         try:
-            from funct.funct_calibCam import CameraCalibration
-            
-            self.logger.info("Starting camera calibration")
-            
-            # Verify camera is connected
+            self.logger.info("Starting camera calibration (GUI flow)")
+
             if not self.camera_helper or not self.camera_helper.camera:
                 raise RuntimeError("Camera not connected")
-            
-            # Initialize calibration class
-            calibration = CameraCalibration()
-            calibration.set_camera(self.camera_helper)
-            
-            # Run calibration and get results
+
+            # Ensure genicam_helper has camera attached
             try:
-                # Capture calibration images
-                images = []
-                for i in range(5):
-                    image = calibration.capture_calibration_image()
-                    images.append(image)
-                    self.logger.info(f"Captured calibration image {i+1}")
-                
-                # Perform calibration
-                success = calibration.calibrate_camera(images)
-                
-                if success:
-                    self.logger.info("Camera calibration completed successfully")
-                    self.view.update_test_results("Camera Calibration", "Calibration completed successfully!")
-                else:
-                    self.logger.warning("Camera calibration failed")
-                    self.view.update_test_results("Camera Calibration", "Calibration failed!")
-                
-                return success
-                
-            except Exception as e:
-                error_msg = f"Camera calibration execution failed: {str(e)}"
-                self.logger.error(error_msg)
-                self.view.show_error("Test Error", error_msg)
-                return False
+                if getattr(self.genicam_helper, 'camera', None) is None:
+                    self.genicam_helper.set_camera(self.camera_helper.camera)
+            except Exception:
+                pass
+
+            # Stop any active live view so dialog initially shows chart only
+            try:
+                if getattr(self, 'is_live_grabbing', False):
+                    self.logger.debug("Stopping live view before opening calibration dialog")
+                    try:
+                        self.stop_live_view()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Also ensure the view's live timer is stopped and live image cleared
+            try:
+                if hasattr(self.view, 'live_timer'):
+                    try:
+                        self.view.live_timer.stop()
+                    except Exception:
+                        pass
+                if hasattr(self.view, 'image_label'):
+                    try:
+                        self.view.image_label.clear()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Lazy import of the dialog to avoid circular imports with the view module
+            from gui.main_gui import CameraCalibrationDialog
+
+            # Construct and execute the dialog directly so presenter controls the flow
+            dlg = CameraCalibrationDialog(self.view, self.genicam_helper, self.camera_helper)
+            res = dlg.exec_()
+            accepted = (res == QDialog.Accepted)
+            self.logger.info(f"Camera calibration dialog closed with result: {accepted}")
+            return accepted
+
         except Exception as e:
             error_msg = f"Failed to initialize camera calibration: {str(e)}"
             self.logger.error(error_msg)
-            self.view.show_error("Test Error", error_msg)
+            try:
+                self.view.show_error("Calibration Error", error_msg)
+            except Exception:
+                pass
             return False
 
     def run_edge_detection(self):

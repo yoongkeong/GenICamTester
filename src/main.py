@@ -11,7 +11,16 @@ import struct
 import numpy as np
 import cv2
 from PIL import Image
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+    # Delay logging setup; use print as fallback until logging configured
+    try:
+        from loguru import logger as _log
+        _log.warning('matplotlib unavailable or incompatible; plotting disabled')
+    except Exception:
+        print('matplotlib unavailable or incompatible; plotting disabled')
 from typing_extensions import TypedDict
 import requests
 from loguru import logger
