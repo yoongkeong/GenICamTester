@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QImage, QPixmap, QPainter
 from PyQt5.QtCore import Qt, QTimer, QDateTime, QEvent, QPoint, QThread, pyqtSignal, QObject
+import logging
 import cv2
 import numpy as np
 from .presenter import CameraPresenter
@@ -107,16 +108,49 @@ class ThreadSafeViewProxy:
     """
     def __init__(self, invoker: ViewInvoker):
         self._inv = invoker
+        self._runlog_bridge = None
 
     # Mirror subset of CameraTestGUI API used by presenter
     def log_message(self, message: str, level: str = "INFO"):
+        # Emit to global system log
         self._inv.sig_log_message.emit(message, level)
+        # Also mirror to the per-test console when attached
+        try:
+            if self._runlog_bridge is not None:
+                self._runlog_bridge.sig_append.emit(message, level)
+        except Exception:
+            pass
 
     def update_test_results(self, title: str, results: str):
         self._inv.sig_update_test_results.emit(title, results)
 
     def show_error(self, title: str, message: str):
         self._inv.sig_show_error.emit(title, message)
+
+    def attach_run_log(self, bridge: 'RunLogBridge'):
+        self._runlog_bridge = bridge
+
+    def detach_run_log(self):
+        self._runlog_bridge = None
+
+class RunLogBridge(QObject):
+    """Signal bridge to append run log lines on the GUI thread."""
+    sig_append = pyqtSignal(str, str)  # message, level
+
+class UITestRunHandler(logging.Handler):
+    """Logging handler that forwards records to the Test Setup run log via a Qt signal."""
+    def __init__(self, bridge: RunLogBridge):
+        super().__init__()
+        self._bridge = bridge
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = record.getMessage()
+            level = getattr(record, 'levelname', 'INFO')
+            # Forward to GUI thread via signal
+            self._bridge.sig_append.emit(msg, level)
+        except Exception:
+            pass
 
 class CameraTestGUI(QMainWindow):
     def __init__(self):
@@ -281,7 +315,7 @@ class CameraTestGUI(QMainWindow):
 
     def get_threadsafe_view_proxy(self) -> ThreadSafeViewProxy:
         return self._threadsafe_view_proxy
-        
+
     def init_welcome_page(self):
         """Initialize welcome page with software description"""
         self.welcome_page = QWidget()
@@ -1933,6 +1967,13 @@ class TestSetupDialog(QDialog):
         # Build UI
         self._build_ui()
 
+        # Run log bridge and state (after UI is built)
+        self._runlog_bridge = RunLogBridge(self)
+        self._runlog_bridge.sig_append.connect(self._on_bridge_log)
+        self._runlog_max_lines = 1000
+        self._runlog_truncated = False
+        self._last_line_cache = None
+
         # Start live view immediately for user adjustments
         try:
             self.parent.presenter.start_live_view()
@@ -2124,6 +2165,38 @@ class TestSetupDialog(QDialog):
         vlay.addWidget(self.live_label)
         grp.setLayout(vlay)
         right.addWidget(grp)
+
+        # Run Log console below live view
+        log_group = QGroupBox("Run Log")
+        lglay = QVBoxLayout()
+
+        # Live indicator row
+        ind_row = QHBoxLayout()
+        self.live_indicator = QLabel("● Live")
+        self.live_indicator.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.live_indicator.setVisible(False)
+        ind_row.addWidget(self.live_indicator)
+        ind_row.addStretch()
+        # Copy/Save buttons
+        self.btn_copy_all = QPushButton("Copy All")
+        self.btn_copy_all.clicked.connect(self._copy_all_log)
+        ind_row.addWidget(self.btn_copy_all)
+        self.btn_save_log = QPushButton("Save Log…")
+        self.btn_save_log.clicked.connect(self._save_log)
+        ind_row.addWidget(self.btn_save_log)
+        lglay.addLayout(ind_row)
+
+        # Text console
+        from PyQt5.QtWidgets import QTextEdit
+        self.run_log_text = QTextEdit()
+        self.run_log_text.setReadOnly(True)
+        self.run_log_text.setLineWrapMode(QTextEdit.NoWrap)
+        self.run_log_text.setMinimumHeight(160)
+        self.run_log_text.setStyleSheet("QTextEdit { font-family: 'Consolas', 'Courier New', monospace; }")
+        lglay.addWidget(self.run_log_text)
+
+        log_group.setLayout(lglay)
+        right.addWidget(log_group)
         right.addStretch()
         right_w = QWidget(); right_w.setLayout(right)
         root.addWidget(right_w, 6)
@@ -2153,6 +2226,12 @@ class TestSetupDialog(QDialog):
         self._progress.set_progress_range(0, 0)  # Indeterminate
         self._progress.update_status("Running…")
 
+        # Prepare run log console
+        self.run_log_text.clear()
+        self._runlog_truncated = False
+        self._last_line_cache = None
+        self.live_indicator.setVisible(True)
+
         # Freeze live view image and stop grabbing to avoid conflicts with tests starting acquisition
         try:
             # Grab last frame to display while test runs
@@ -2177,9 +2256,18 @@ class TestSetupDialog(QDialog):
         # Swap presenter's view to thread-safe proxy so worker can safely trigger GUI updates
         try:
             self._orig_view = self.parent.presenter.view
-            self.parent.presenter.view = self.parent.get_threadsafe_view_proxy()
+            proxy = self.parent.get_threadsafe_view_proxy()
+            self.parent.presenter.view = proxy
+            # Also mirror view.log_message to this dialog run log
+            proxy.attach_run_log(self._runlog_bridge)
         except Exception:
             self._orig_view = None
+
+        # Install logging handler to forward logger output to the run log
+        import logging as _logging
+        self._log_handler = UITestRunHandler(self._runlog_bridge)
+        self._log_handler.setLevel(_logging.DEBUG)
+        _logging.getLogger().addHandler(self._log_handler)
 
         # Launch worker thread to run the provided callable
         self._thread = QThread()
@@ -2202,7 +2290,9 @@ class TestSetupDialog(QDialog):
             # but keep right panel live for other flows as required
         except Exception:
             pass
-        self.parent.log_message("User requested cancellation.", "WARNING")
+        # Immediate cancellation line in both consoles
+        self._append_run_log("Cancelled by user", "WARNING")
+        self.parent.log_message("Cancelled by user", "WARNING")
 
     def _on_finished(self, success: bool, error_message: str):
         try:
@@ -2221,6 +2311,17 @@ class TestSetupDialog(QDialog):
         try:
             if getattr(self, '_orig_view', None) is not None:
                 self.parent.presenter.view = self._orig_view
+            # Detach run log mirroring
+            self.parent.get_threadsafe_view_proxy().detach_run_log()
+        except Exception:
+            pass
+
+        # Remove logging handler
+        try:
+            import logging as _logging
+            if getattr(self, '_log_handler', None) is not None:
+                _logging.getLogger().removeHandler(self._log_handler)
+                self._log_handler = None
         except Exception:
             pass
 
@@ -2228,12 +2329,16 @@ class TestSetupDialog(QDialog):
         try:
             if success:
                 QMessageBox.information(self, self.test_name, f"{self.test_name} completed successfully.")
+                self._append_run_log("Completed successfully.", "SUCCESS")
             else:
                 # Treat cancel differently from failure based on message
                 if error_message and 'cancel' in error_message.lower():
                     QMessageBox.information(self, self.test_name, f"{self.test_name} was cancelled.")
+                    self._append_run_log("Cancelled by user", "WARNING")
                 else:
                     QMessageBox.warning(self, self.test_name, f"{self.test_name} failed.\n\n{error_message or ''}")
+                    if error_message:
+                        self._append_run_log(error_message, "ERROR")
         except Exception:
             pass
 
@@ -2241,6 +2346,12 @@ class TestSetupDialog(QDialog):
         try:
             self.parent.presenter.start_live_view()
             self._live_timer.start(33)
+        except Exception:
+            pass
+
+        # Turn off live indicator
+        try:
+            self.live_indicator.setVisible(False)
         except Exception:
             pass
 
@@ -2253,6 +2364,110 @@ class TestSetupDialog(QDialog):
 
         # Note: Detailed results are shown by presenter via update_test_results.
         # Keep setup dialog open to allow user to adjust further or close.
+
+    # ---------- Run Log console helpers ----------
+    def _on_bridge_log(self, message: str, level: str):
+        # From GUI thread via signal; append to console and mirror to System Log
+        self._append_run_log(message, level)
+        # Also append to global System Log viewer with prefix applied there
+        try:
+            self.parent.log_message(message, level)
+        except Exception:
+            pass
+
+    def _append_run_log(self, message: str, level: str = "INFO"):
+        try:
+            # Deduplicate immediate repeats
+            line_key = f"{level}|{message}"
+            if line_key == self._last_line_cache:
+                return
+            self._last_line_cache = line_key
+
+            # Truncate long lines
+            max_len = 2000
+            if len(message) > max_len:
+                message = message[:max_len] + "…"
+
+            # Soft cap on number of lines
+            doc = self.run_log_text.document()
+            total_blocks = doc.blockCount()
+            if total_blocks >= self._runlog_max_lines:
+                if not self._runlog_truncated:
+                    # Insert a one-time notice
+                    notice = "(older lines truncated)"
+                    self._append_html_line(self._format_html('INFO', notice))
+                    self._runlog_truncated = True
+                # Remove first block by reconstructing minimal content: clear and rebuild last N-1? Simpler: just clear and add notice
+                self.run_log_text.clear()
+                self._append_html_line(self._format_html('INFO', "(older lines truncated)"))
+
+            # Determine color by level
+            lvl = (level or "INFO").upper()
+            # Prefix with test name
+            test_prefix = f"[{self.test_name}] "
+            ts = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+            disp = f"{test_prefix}{message}"
+            html = self._format_html(lvl, disp, ts)
+
+            # Auto-scroll behavior: keep if already at bottom
+            sb = self.run_log_text.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 2
+            self._append_html_line(html)
+            if at_bottom:
+                sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+    def _format_html(self, level: str, text: str, ts: str = None) -> str:
+        color = {
+            "INFO": "black",
+            "WARNING": "#FFA500",
+            "ERROR": "red",
+            "SUCCESS": "green",
+            "DEBUG": "#666666",
+        }.get(level.upper(), "black")
+        ts = ts or QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+        return f'<p style="margin:0; white-space: pre;">' \
+               f'<span style="color:#666;">{ts}</span> ' \
+               f'<span style="color:{color};">[{level.upper()}]</span> ' \
+               f'{self._escape_html(text)}</p>'
+
+    def _append_html_line(self, html: str):
+        self.run_log_text.append(html)
+
+    def _escape_html(self, s: str) -> str:
+        return (s.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+                 .replace('"', "&quot;")
+                 .replace("'", "&#39;"))
+
+    def _copy_all_log(self):
+        try:
+            self.run_log_text.selectAll()
+            self.run_log_text.copy()
+            # Clear selection to avoid highlighting
+            cursor = self.run_log_text.textCursor()
+            cursor.clearSelection()
+            self.run_log_text.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _save_log(self):
+        try:
+            ts = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+            default_name = f"{self.test_name.replace(' ', '')}_RunLog_{ts}.txt"
+            path, _ = QFileDialog.getSaveFileName(self, "Save Run Log", default_name, "Text Files (*.txt);;All Files (*)")
+            if path:
+                # Save plain text (without HTML tags)
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(self.run_log_text.toPlainText())
+                try:
+                    self.parent.log_message(f"Run log saved to {path}", "SUCCESS")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 class CameraCalibrationDialog(QDialog):
     def __init__(self, parent, genicam_helper, camera_helper):
