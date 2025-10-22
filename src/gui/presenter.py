@@ -30,6 +30,8 @@ class CameraPresenter:
         self.test_start_time = None
         self._last_frame_log_time = 0
         self._frames_since_last_log = 0
+        # Store last explicitly captured frame for GUI preview/save
+        self.last_captured_frame = None
         self._init_logging()
 
     def _init_logging(self):
@@ -212,37 +214,123 @@ class CameraPresenter:
             return None
 
     def snap_image(self):
-        """Capture a single image from the camera"""
+        """Capture a single image from the camera and store it for preview/save."""
         try:
             self.logger.info("Capturing single image")
-            
+
             if not self.camera_helper or not self.camera_helper.camera:
                 raise RuntimeError("Camera not connected")
-            
-            # Capture image
-            frame = self.get_current_frame()
+
+            cam = self.camera_helper.camera
+            frame = None
+
+            # Try direct single-frame grab using GrabOne (works without live view)
+            try:
+                if hasattr(cam, 'GrabOne'):
+                    self.logger.debug("Attempting GrabOne() for single image capture")
+                    grab = cam.GrabOne(1000)
+                    if grab and hasattr(grab, 'GrabSucceeded') and grab.GrabSucceeded():
+                        frame = grab.Array
+                    try:
+                        if grab is not None:
+                            grab.Release()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.logger.debug(f"GrabOne failed: {e}")
+
+            # Fallback: try helper's get_frame
+            if frame is None:
+                try:
+                    self.logger.debug("Falling back to camera_helper.get_frame()")
+                    frame = self.camera_helper.get_frame(self.camera)
+                except Exception as e:
+                    self.logger.debug(f"camera_helper.get_frame failed: {e}")
+
+            # If still no frame, attempt a software trigger (GenICam) if supported
+            if frame is None and getattr(self, 'genicam_helper', None) is not None:
+                try:
+                    gh = self.genicam_helper
+                    # Ensure helper has camera attached
+                    try:
+                        if getattr(gh, 'camera', None) is None:
+                            gh.set_camera(self.camera_helper.camera)
+                    except Exception:
+                        pass
+
+                    # Configure trigger to software and execute
+                    if gh.has_node('TriggerMode') and gh.has_node('TriggerSource'):
+                        try:
+                            gh.set_node_value('TriggerMode', 'On')
+                            gh.set_node_value('TriggerSource', 'Software')
+                        except Exception:
+                            # ignore failures to set
+                            pass
+
+                    # Execute software trigger command if available
+                    trig_node = gh._get_node('TriggerSoftware') if hasattr(gh, '_get_node') else None
+                    executed = False
+                    if trig_node is not None:
+                        for cmd in ('Execute', 'ExecuteCommand', 'Run'):
+                            try:
+                                if hasattr(trig_node, cmd):
+                                    getattr(trig_node, cmd)()
+                                    executed = True
+                                    break
+                            except Exception:
+                                continue
+
+                    # After triggering, try to GrabOne/RetrieveResult
+                    if executed:
+                        try:
+                            if hasattr(cam, 'RetrieveResult'):
+                                grab = cam.RetrieveResult(1000)
+                                if grab and hasattr(grab, 'GrabSucceeded') and grab.GrabSucceeded():
+                                    frame = grab.Array
+                                try:
+                                    if grab is not None:
+                                        grab.Release()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            try:
+                                grab = cam.GrabOne(1000)
+                                if grab and hasattr(grab, 'GrabSucceeded') and grab.GrabSucceeded():
+                                    frame = grab.Array
+                                try:
+                                    if grab is not None:
+                                        grab.Release()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                except Exception as e:
+                    self.logger.debug(f"Software trigger attempt failed: {e}")
+
             if frame is not None:
                 self.logger.info("Image captured successfully")
                 self.view.log_message("Image captured successfully", "SUCCESS")
-                
-                # Save image to file
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                filename = f"snap_image_{timestamp}.png"
-                cv2.imwrite(filename, frame)
-                self.logger.info(f"Image saved to {filename}")
-                self.view.log_message(f"Image saved to {filename}", "SUCCESS")
-                
-                return True
+                # Store for preview/save
+                self.last_captured_frame = frame
+                # Instruct view to display preview in the live view area
+                try:
+                    if hasattr(self.view, 'show_captured_image'):
+                        self.view.show_captured_image(frame)
+                except Exception:
+                    pass
+
+                return frame
             else:
                 self.logger.warning("Failed to capture image")
                 self.view.log_message("Failed to capture image", "WARNING")
-                return False
-                
+                return None
+
         except Exception as e:
             error_msg = f"Image capture failed: {str(e)}"
             self.logger.error(error_msg)
             self.view.log_message(error_msg, "ERROR")
-            return False
+            return None
 
     def detect_usb_camera(self):
         """Detect and connect to a USB camera"""
@@ -915,50 +1003,63 @@ class CameraPresenter:
             return False
 
     def run_camera_calibration(self):
-        """Run camera calibration"""
+        """Run camera calibration - construct and show the calibration dialog directly."""
         try:
-            from funct.funct_calibCam import CameraCalibration
-            
-            self.logger.info("Starting camera calibration")
-            
-            # Verify camera is connected
+            self.logger.info("Starting camera calibration (GUI flow)")
+
             if not self.camera_helper or not self.camera_helper.camera:
                 raise RuntimeError("Camera not connected")
-            
-            # Initialize calibration class
-            calibration = CameraCalibration()
-            calibration.set_camera(self.camera_helper)
-            
-            # Run calibration and get results
+
+            # Ensure genicam_helper has camera attached
             try:
-                # Capture calibration images
-                images = []
-                for i in range(5):
-                    image = calibration.capture_calibration_image()
-                    images.append(image)
-                    self.logger.info(f"Captured calibration image {i+1}")
-                
-                # Perform calibration
-                success = calibration.calibrate_camera(images)
-                
-                if success:
-                    self.logger.info("Camera calibration completed successfully")
-                    self.view.update_test_results("Camera Calibration", "Calibration completed successfully!")
-                else:
-                    self.logger.warning("Camera calibration failed")
-                    self.view.update_test_results("Camera Calibration", "Calibration failed!")
-                
-                return success
-                
-            except Exception as e:
-                error_msg = f"Camera calibration execution failed: {str(e)}"
-                self.logger.error(error_msg)
-                self.view.show_error("Test Error", error_msg)
-                return False
+                if getattr(self.genicam_helper, 'camera', None) is None:
+                    self.genicam_helper.set_camera(self.camera_helper.camera)
+            except Exception:
+                pass
+
+            # Stop any active live view so dialog initially shows chart only
+            try:
+                if getattr(self, 'is_live_grabbing', False):
+                    self.logger.debug("Stopping live view before opening calibration dialog")
+                    try:
+                        self.stop_live_view()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Also ensure the view's live timer is stopped and live image cleared
+            try:
+                if hasattr(self.view, 'live_timer'):
+                    try:
+                        self.view.live_timer.stop()
+                    except Exception:
+                        pass
+                if hasattr(self.view, 'image_label'):
+                    try:
+                        self.view.image_label.clear()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Lazy import of the dialog to avoid circular imports with the view module
+            from gui.main_gui import CameraCalibrationDialog
+
+            # Construct and execute the dialog directly so presenter controls the flow
+            dlg = CameraCalibrationDialog(self.view, self.genicam_helper, self.camera_helper)
+            res = dlg.exec_()
+            accepted = (res == QDialog.Accepted)
+            self.logger.info(f"Camera calibration dialog closed with result: {accepted}")
+            return accepted
+
         except Exception as e:
             error_msg = f"Failed to initialize camera calibration: {str(e)}"
             self.logger.error(error_msg)
-            self.view.show_error("Test Error", error_msg)
+            try:
+                self.view.show_error("Calibration Error", error_msg)
+            except Exception:
+                pass
             return False
 
     def run_edge_detection(self):
@@ -1261,38 +1362,511 @@ class CameraPresenter:
             return False
 
     def run_init_cam_test(self):
-        """Run camera initialization test (adapted to functional pytest test)"""
+        """Run camera initialization test (robust, non-invasive).
+
+        Scope: modify test routine logic only; reuse existing helpers and UI wiring.
+        """
         import time
+        import json
+        import os
+        import platform
+        from configparser import ConfigParser
+        from pypylon import pylon
+
+        TEST_NAME = "Camera Initialization Test"
+
+        def log(level: str, msg: str):
+            try:
+                self.view.log_message(msg, level)
+            except Exception:
+                pass
+            # Mirror to presenter logger at similar level
+            lvl = (level or "INFO").upper()
+            if lvl == "ERROR":
+                self.logger.error(msg)
+            elif lvl in ("WARN", "WARNING"):
+                self.logger.warning(msg)
+            elif lvl == "SUCCESS":
+                self.logger.info(msg)
+            else:
+                self.logger.info(msg)
+
+        # Load optional configuration with sensible defaults
+        cfg = ConfigParser()
         try:
-            self.logger.info("Starting camera initialization test (functional mode)")
-            if not self.camera_helper or not self.camera_helper.camera:
-                raise RuntimeError("Camera not connected")
+            cfg.read(os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'config', 'config.ini'))
+        except Exception:
+            pass
 
-            start = time.time()
-            cam = self.camera_helper.camera
-            if not cam.IsOpen():
-                raise RuntimeError("Camera not open")
+        def cfg_get(section: str, option: str, default, cast=str):
+            try:
+                if not cfg.has_section(section) or not cfg.has_option(section, option):
+                    return default
+                val = cfg.get(section, option)
+                return cast(val)
+            except Exception:
+                return default
 
-            grab = cam.GrabOne(500)
-            ok = grab and grab.GrabSucceeded()
-            if grab:
-                grab.Release()
-            elapsed = time.time() - start
-            if not ok:
-                raise RuntimeError("Failed to grab test frame during initialization")
-            if elapsed < 0:
-                raise RuntimeError("Invalid timing captured")
+        # Configurable inputs with defaults
+        transport = cfg_get('CAMERA', 'transport', 'auto', str).lower()  # auto|GEV|U3V
+        open_timeout_ms = cfg_get('CAMERA', 'open_timeout_ms', 3000, int)
+        grab_timeout_ms = cfg_get('CAMERA', 'grab_timeout_ms', 2000, int)
+        allowed_pixelformats = cfg_get('CAMERA', 'allowed_pixelformats', 'Mono8,BayerRG8,YCbCr422_8', str)
+        allowed_pixelformats = [s.strip() for s in allowed_pixelformats.split(',') if s.strip()]
+        gev_min_heartbeat_ms = cfg_get('CAMERA', 'gev_min_heartbeat_ms', 3000, int)
+        expected_link_gbps = cfg_get('CAMERA', 'expected_link_gbps', 5, float)
+        preferred_serial = cfg_get('CAMERA', 'preferred_serial', '', str).strip()
+        userset_to_load = cfg_get('CAMERA', 'userset', '', str).strip()
 
-            results = {"success": True, "elapsed": elapsed}
-            self.logger.info(f"Camera initialization test completed: {results}")
-            summary = self._format_init_cam_results(results)
-            self.view.update_test_results("Camera Initialization Test", summary)
-            return True
+        # No artifact directory creation (JSON output removed per request)
+
+        # Stage helpers (log; progress mapping via text only)
+        def stage(pct: int, text: str):
+            log('INFO', f"[{pct}%] {text}")
+
+        # Host/SDK block
+        try:
+            host = {
+                'os': platform.platform(),
+                'python': platform.python_version(),
+                'pylon_version': getattr(pylon, 'PylonVersion', None) or getattr(pylon, 'GetPylonVersionString', lambda: 'unknown')(),
+            }
+        except Exception:
+            host = {'os': platform.platform(), 'python': platform.python_version(), 'pylon_version': 'unknown'}
+        log('INFO', f"Host/SDK: {host}")
+
+        # Discovery & select
+        t0 = time.time()
+        stage(10, "Discover devices")
+        try:
+            devices = self.camera_helper.enumerate_cameras()
         except Exception as e:
-            error_msg = f"Camera initialization test failed: {str(e)}"
-            self.logger.error(error_msg)
-            self.view.show_error("Test Error", error_msg)
+            devices = []
+            log('ERROR', f"Discovery failed: {e}")
+
+        # Filter by transport
+        def iface_kind(d: dict) -> str:
+            return (d.get('interface') or '').lower()
+
+        if transport == 'gev':
+            devices = [d for d in devices if 'gig' in iface_kind(d) or 'gev' in iface_kind(d) or 'baslergig' in iface_kind(d)]
+        elif transport == 'u3v':
+            devices = [d for d in devices if 'usb' in iface_kind(d) or 'u3v' in iface_kind(d) or iface_kind(d) == 'baslerusb']
+        # else auto = no extra filter
+
+        if not devices:
+            log('ERROR', f"No GenICam devices found on {transport.upper() if transport!='auto' else 'AUTO'}. Check cables/power/driver. For GEV: confirm NIC, IP subnet, firewall.")
+            self.view.show_error(TEST_NAME, "No matching devices found.")
             return False
+
+        # Select by serial if provided
+        stage(20, "Select target device")
+        target = None
+        if preferred_serial:
+            for d in devices:
+                if d.get('id') == preferred_serial:
+                    target = d; break
+        if target is None:
+            target = devices[0]
+        log('INFO', f"Selected device: {target}")
+
+        # Open with exclusive access (pylon opens exclusively by default)
+        stage(30, "Open device")
+        t_open0 = time.time()
+        try:
+            # Stop any live stream from GUI path before test open (UI already tries)
+            try:
+                if hasattr(self, 'stop_live_view'):
+                    self.stop_live_view()
+            except Exception:
+                pass
+            # If a camera is currently open via helper, close it to avoid exclusive-open conflict
+            try:
+                if self.camera_helper and self.camera_helper.camera and self.camera_helper.camera.IsOpen():
+                    try:
+                        if self.camera_helper.camera.IsGrabbing():
+                            self.camera_helper.camera.StopGrabbing()
+                    except Exception:
+                        pass
+                    self.camera_helper.camera.Close()
+            except Exception:
+                pass
+            cam = self.camera_helper.connect_camera(target)
+            self.genicam_helper.set_camera(cam)
+            self.camera = cam
+        except Exception as e:
+            log('ERROR', f"Open failed: {e}")
+            self.view.show_error(TEST_NAME, f"Exclusive access denied—camera in use by another app. Close it and retry. Details: {e}")
+            return False
+        open_time = time.time() - t_open0
+
+        # Optional: load UserSet
+        if userset_to_load:
+            stage(35, "Load UserSet")
+            try:
+                self.genicam_helper.set_node_value('UserSetSelector', userset_to_load)
+                self.genicam_helper.set_node_value('UserSetLoad', True)
+                log('INFO', f"Loaded UserSet: {userset_to_load}")
+            except Exception as e:
+                log('WARN', f"Failed to load UserSet '{userset_to_load}': {e}")
+
+        # Identity verification
+        stage(45, "Read identity")
+        ident = {}
+        try:
+            info = cam.GetDeviceInfo()
+            # Pylon DeviceInfo methods
+            def safe_get(m):
+                try:
+                    return getattr(info, m)()
+                except Exception:
+                    return ''
+            ident = {
+                'DeviceVendorName': safe_get('GetVendorName'),
+                'DeviceModelName': safe_get('GetModelName'),
+                'DeviceSerialNumber': safe_get('GetSerialNumber'),
+                'DeviceVersion': safe_get('GetDeviceVersion') or safe_get('GetDeviceVersionString'),
+                'DeviceFirmwareVersion': safe_get('GetFirmwareVersion') or safe_get('GetFirmwareVersionString'),
+            }
+            # Validate non-empty required
+            required = ['DeviceVendorName', 'DeviceModelName', 'DeviceSerialNumber']
+            if any(not ident.get(k) for k in required):
+                raise RuntimeError("Required identity nodes missing/empty")
+            log('INFO', f"Identity: {ident}")
+        except Exception as e:
+            log('ERROR', f"Identity read failed: {e}")
+            # Continue to cleanup below
+            try:
+                cam.Close()
+            except Exception:
+                pass
+            self.view.show_error(TEST_NAME, f"Identity verification failed: {e}")
+            return False
+
+        # Transport snapshot
+        stage(55, "Read transport")
+        transport_snapshot = {}
+        try:
+            if transport in ('auto', 'gev'):
+                try:
+                    transport_snapshot.update({
+                        'GevCurrentIPAddress': self.genicam_helper.get_node_value('GevCurrentIPAddress') if self.genicam_helper.has_node('GevCurrentIPAddress') else None,
+                        'GevSCPSPacketSize': self.genicam_helper.get_node_value('GevSCPSPacketSize') if self.genicam_helper.has_node('GevSCPSPacketSize') else None,
+                        'GevSCPD': self.genicam_helper.get_node_value('GevSCPD') if self.genicam_helper.has_node('GevSCPD') else None,
+                        'GevHeartbeatTimeout': self.genicam_helper.get_node_value('GevHeartbeatTimeout') if self.genicam_helper.has_node('GevHeartbeatTimeout') else None,
+                    })
+                except Exception as e:
+                    log('WARN', f"GEV transport snapshot partial: {e}")
+                # Heartbeat sanity
+                try:
+                    hb = transport_snapshot.get('GevHeartbeatTimeout')
+                    if hb is not None and int(hb) < int(gev_min_heartbeat_ms):
+                        log('WARN', f"GEV heartbeat ({hb} ms) below minimum {gev_min_heartbeat_ms} ms; attempting to increase…")
+                        try:
+                            self.genicam_helper.set_node_value('GevHeartbeatTimeout', int(gev_min_heartbeat_ms))
+                            transport_snapshot['GevHeartbeatTimeout'] = self.genicam_helper.get_node_value('GevHeartbeatTimeout')
+                            log('SUCCESS', f"GEV heartbeat increased to {transport_snapshot['GevHeartbeatTimeout']} ms")
+                        except Exception as e2:
+                            log('WARN', f"Failed to increase heartbeat: {e2}")
+                except Exception:
+                    pass
+            if transport in ('auto', 'u3v'):
+                try:
+                    # Best-effort U3V link info
+                    # Common nodes vary; try a few
+                    link = {
+                        'DeviceLinkThroughputLimit': self.genicam_helper.get_node_value('DeviceLinkThroughputLimit') if self.genicam_helper.has_node('DeviceLinkThroughputLimit') else None,
+                        'DeviceLinkCurrentThroughput': self.genicam_helper.get_node_value('DeviceLinkCurrentThroughput') if self.genicam_helper.has_node('DeviceLinkCurrentThroughput') else None,
+                        'DeviceLinkSpeed': self.genicam_helper.get_node_value('DeviceLinkSpeed') if self.genicam_helper.has_node('DeviceLinkSpeed') else None,
+                    }
+                    transport_snapshot.update(link)
+                    # Sanity: link speed if available
+                    sp = link.get('DeviceLinkSpeed')
+                    if sp:
+                        try:
+                            gbps = float(sp) / 1e9
+                            if gbps + 1e-6 < expected_link_gbps:
+                                log('WARN', f"U3V link speed low ({gbps:.2f} Gbps < {expected_link_gbps:.2f} Gbps); continuing")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log('WARN', f"U3V transport snapshot partial: {e}")
+        except Exception:
+            pass
+
+        # Stream preparation
+        stage(65, "Configure stream")
+        stream_cfg = {}
+        try:
+            # Trigger/Acquisition modes
+            try:
+                if self.genicam_helper.has_node('TriggerMode'):
+                    self.genicam_helper.set_node_value('TriggerMode', 'Off')
+            except Exception as e:
+                log('WARN', f"Could not set TriggerMode=Off: {e}")
+            try:
+                if self.genicam_helper.has_node('AcquisitionMode'):
+                    self.genicam_helper.set_node_value('AcquisitionMode', 'Continuous')
+            except Exception as e:
+                log('WARN', f"Could not set AcquisitionMode=Continuous: {e}")
+
+            # PixelFormat priority attempt
+            chosen_fmt = None
+            for fmt in allowed_pixelformats:
+                try:
+                    if self.genicam_helper.has_node('PixelFormat'):
+                        self.genicam_helper.set_node_value('PixelFormat', fmt)
+                        chosen_fmt = fmt
+                        log('INFO', f"PixelFormat set to {fmt}")
+                        break
+                except Exception:
+                    continue
+            if chosen_fmt is None:
+                log('WARN', "PixelFormat not changeable; proceeding with current")
+                try:
+                    chosen_fmt = self.genicam_helper.get_node_value('PixelFormat') if self.genicam_helper.has_node('PixelFormat') else None
+                except Exception:
+                    pass
+
+            # Payload and ROI sanity
+            w = h = payload = None
+            try:
+                w = int(self.genicam_helper.get_node_value('Width')) if self.genicam_helper.has_node('Width') else None
+                h = int(self.genicam_helper.get_node_value('Height')) if self.genicam_helper.has_node('Height') else None
+            except Exception:
+                pass
+            try:
+                payload = int(self.genicam_helper.get_node_value('PayloadSize')) if self.genicam_helper.has_node('PayloadSize') else None
+            except Exception:
+                pass
+            if payload is None or payload <= 0:
+                log('ERROR', f"Invalid PayloadSize: {payload}")
+                cam.Close()
+                self.view.show_error(TEST_NAME, "Invalid payload size")
+                return False
+
+            def bpp_for(fmt: str) -> float:
+                # Common approximations
+                m = (fmt or '').lower()
+                if 'mono8' in m or 'bayer' in m and '8' in m:
+                    return 8
+                if 'mono12' in m or '12' in m:
+                    return 12
+                if 'mono16' in m or '16' in m:
+                    return 16
+                if 'ycbcr422_8' in m or 'yuv422' in m:
+                    return 16  # 16 bits per pixel
+                if 'rgb8' in m:
+                    return 24
+                return 0
+
+            if w and h and chosen_fmt:
+                bpp = bpp_for(chosen_fmt)
+                if bpp > 0:
+                    expected = int(w * h * bpp / 8)
+                    if abs(expected - payload) > max(1, int(0.01 * expected)):
+                        log('WARN', f"Payload mismatch: W×H×bpp={expected} vs PayloadSize={payload}")
+
+            stream_cfg = {'Width': w, 'Height': h, 'PixelFormat': chosen_fmt, 'PayloadSize': payload,
+                          'AcquisitionMode': 'Continuous', 'TriggerMode': 'Off'}
+        except Exception as e:
+            log('WARN', f"Stream configuration partial: {e}")
+
+        # Acquisition cycle
+        stage(80, "Acquire 3 frames")
+        first_frame_latency = None
+        frame_stats = {'count': 0, 'means': [], 'vars': [], 'suspicious': False}
+        t_acq0 = time.time()
+        try:
+            # Start grabbing
+            try:
+                cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            except Exception:
+                pass
+            last_ts = None
+            for i in range(3):
+                t_f0 = time.time()
+                try:
+                    grab = cam.RetrieveResult(grab_timeout_ms)
+                    ok = grab and grab.GrabSucceeded()
+                    arr = grab.Array if ok else None
+                    try:
+                        grab.Release()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    ok = False
+                    arr = None
+                    log('ERROR', f"Grab timeout or error: {e}")
+                if not ok or arr is None:
+                    cam.StopGrabbing()
+                    cam.Close()
+                    self.view.show_error(TEST_NAME, "Grab timeout—try increasing grab_timeout_ms; check bandwidth/packet size; verify PixelFormat/payload.")
+                    return False
+                if arr.size == 0:
+                    cam.StopGrabbing(); cam.Close()
+                    self.view.show_error(TEST_NAME, "Empty frame received")
+                    return False
+
+                # First frame latency
+                if i == 0:
+                    first_frame_latency = time.time() - t_f0
+
+                # Timestamp monotonic check (using host time as proxy)
+                now_ts = time.time()
+                if last_ts is not None and now_ts < last_ts:
+                    log('WARN', "Non-monotonic timestamps observed (host time proxy)")
+                last_ts = now_ts
+
+                # Quick stats
+                try:
+                    import numpy as _np
+                    mean = float(_np.mean(arr))
+                    var = float(_np.var(arr))
+                    frame_stats['means'].append(mean)
+                    frame_stats['vars'].append(var)
+                    if var < 1e-6 or mean < 1.0:
+                        frame_stats['suspicious'] = True
+                except Exception:
+                    pass
+                frame_stats['count'] += 1
+
+            # Stop grabbing after cycle
+            try:
+                cam.StopGrabbing()
+            except Exception:
+                pass
+        except Exception as e:
+            log('ERROR', f"Acquisition error: {e}")
+            try:
+                cam.StopGrabbing()
+            except Exception:
+                pass
+            try:
+                cam.Close()
+            except Exception:
+                pass
+            return False
+
+        # Mini robustness checks
+        robustness = {'reopen_ok': False, 'exclusive_denied_handled': False, 'packet_size_fallback': False}
+        try:
+            # Reopen test
+            try:
+                cam.Close()
+            except Exception:
+                pass
+            # Re-open
+            cam = self.camera_helper.connect_camera(target)
+            self.genicam_helper.set_camera(cam)
+            # Re-grab 1 frame
+            try:
+                grab = cam.GrabOne(grab_timeout_ms)
+                ok = grab and grab.GrabSucceeded()
+                arr = grab.Array if ok else None
+                try:
+                    grab.Release()
+                except Exception:
+                    pass
+                robustness['reopen_ok'] = bool(ok and arr is not None and arr.size > 0)
+            except Exception:
+                robustness['reopen_ok'] = False
+
+            # Exclusive access denial simulation with a separate helper to avoid clobbering state
+            try:
+                temp_helper = self.camera_helper.__class__(simulate=self.camera_helper.simulate)
+                try:
+                    temp_helper.connect_camera(target)
+                    # If it unexpectedly succeeds, close immediately and mark handled as False
+                    try:
+                        if temp_helper.camera and temp_helper.camera.IsOpen():
+                            temp_helper.camera.Close()
+                    except Exception:
+                        pass
+                    robustness['exclusive_denied_handled'] = False
+                except Exception:
+                    # Expected: device busy
+                    robustness['exclusive_denied_handled'] = True
+            except Exception:
+                pass
+
+            # Optional GEV packet size sanity
+            try:
+                if transport in ('auto', 'gev') and self.genicam_helper.has_node('GevSCPSPacketSize'):
+                    try:
+                        self.genicam_helper.set_node_value('GevSCPSPacketSize', 9000)
+                    except Exception:
+                        # fallback to 1500
+                        try:
+                            self.genicam_helper.set_node_value('GevSCPSPacketSize', 1500)
+                            robustness['packet_size_fallback'] = True
+                            log('WARN', 'Jumbo frames unsupported—falling back to 1500; verify NIC MTU and switch config.')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        finally:
+            # Final cleanup
+            try:
+                if cam and cam.IsOpen():
+                    try:
+                        if cam.IsGrabbing():
+                            cam.StopGrabbing()
+                    except Exception:
+                        pass
+                    cam.Close()
+            except Exception:
+                pass
+            # Restore connection for GUI flow (re-open selected target so live view can resume)
+            try:
+                cam2 = self.camera_helper.connect_camera(target)
+                self.genicam_helper.set_camera(cam2)
+                self.camera = cam2
+                # Optionally resume live view for right-panel behavior
+                try:
+                    self.start_live_view()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Timing
+        total_duration = time.time() - t0
+        timing = {
+            'discovery_time_ms': int(1000 * (t_open0 - t0)),
+            'open_time_ms': int(1000 * open_time),
+            'first_frame_latency_ms': int(1000 * (first_frame_latency or 0)),
+            'total_duration_ms': int(1000 * total_duration),
+        }
+
+        # Stage 90 still used for validation checkpoint, no persistence
+        stage(90, "Validate state")
+
+        # Pass/Fail evaluation
+        passed = (
+            bool(devices) and bool(target) and bool(ident.get('DeviceSerialNumber')) and
+            frame_stats.get('count', 0) >= 3 and stream_cfg.get('PayloadSize', 0) > 0
+        )
+        if passed:
+            log('SUCCESS', 'PASS')
+        else:
+            log('ERROR', 'FAIL')
+
+        stage(100, f"Complete with {'PASS' if passed else 'FAIL'}")
+
+        # Compose concise summary for UI results dialog
+        summary_lines = [
+            "=== Camera Initialization Test Results ===",
+            f"Identity: {ident}",
+            f"Transport: {transport_snapshot}",
+            f"Stream: {stream_cfg}",
+            f"Timing (ms): {timing}",
+            f"Frames: count={frame_stats.get('count')} suspicious={frame_stats.get('suspicious')}",
+            f"Robustness: {robustness}",
+            f"Final: {'PASS' if passed else 'FAIL'}",
+        ]
+        self.view.update_test_results(TEST_NAME, "\n".join(summary_lines))
+        return bool(passed)
 
     def run_performance_tests(self):
         """Run performance tests"""

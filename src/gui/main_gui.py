@@ -3,13 +3,14 @@
 import sys, time
 import subprocess
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-    QLabel, QStackedWidget, QDialog, QLineEdit, QDialogButtonBox, QFormLayout, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QStackedWidget, QDialog, QLineEdit, QDialogButtonBox, QFormLayout,
     QMessageBox, QGroupBox, QTextEdit, QProgressBar, QSpinBox, QSplitter, QFrame,
-    QFileDialog
+    QFileDialog, QSlider, QComboBox
 )
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import Qt, QTimer, QDateTime
+from PyQt5.QtGui import QImage, QPixmap, QPainter
+from PyQt5.QtCore import Qt, QTimer, QDateTime, QEvent, QPoint, QThread, pyqtSignal, QObject
+import logging
 import cv2
 import numpy as np
 from .presenter import CameraPresenter
@@ -86,12 +87,80 @@ class CameraSelectionDialog(QDialog):
         """Return the selected camera info"""
         return self.selected_camera
 
+class ViewInvoker(QObject):
+    """Lives in GUI thread; exposes signals to perform UI work safely from any thread."""
+    sig_log_message = pyqtSignal(str, str)
+    sig_update_test_results = pyqtSignal(str, str)
+    sig_show_error = pyqtSignal(str, str)
+
+    def __init__(self, parent_gui: 'CameraTestGUI'):
+        super().__init__(parent_gui)
+        self._gui = parent_gui
+        # Connect signals to actual GUI methods
+        self.sig_log_message.connect(self._gui.log_message)
+        self.sig_update_test_results.connect(self._gui.update_test_results)
+        self.sig_show_error.connect(self._gui.show_error)
+
+class ThreadSafeViewProxy:
+    """Proxy object passed as presenter.view while tests run in a worker thread.
+    Forwards GUI-affecting calls to the ViewInvoker signals bound to the GUI thread.
+    Only implements methods used by presenter during tests.
+    """
+    def __init__(self, invoker: ViewInvoker):
+        self._inv = invoker
+        self._runlog_bridge = None
+
+    # Mirror subset of CameraTestGUI API used by presenter
+    def log_message(self, message: str, level: str = "INFO"):
+        # Emit to global system log
+        self._inv.sig_log_message.emit(message, level)
+        # Also mirror to the per-test console when attached
+        try:
+            if self._runlog_bridge is not None:
+                self._runlog_bridge.sig_append.emit(message, level)
+        except Exception:
+            pass
+
+    def update_test_results(self, title: str, results: str):
+        self._inv.sig_update_test_results.emit(title, results)
+
+    def show_error(self, title: str, message: str):
+        self._inv.sig_show_error.emit(title, message)
+
+    def attach_run_log(self, bridge: 'RunLogBridge'):
+        self._runlog_bridge = bridge
+
+    def detach_run_log(self):
+        self._runlog_bridge = None
+
+class RunLogBridge(QObject):
+    """Signal bridge to append run log lines on the GUI thread."""
+    sig_append = pyqtSignal(str, str)  # message, level
+
+class UITestRunHandler(logging.Handler):
+    """Logging handler that forwards records to the Test Setup run log via a Qt signal."""
+    def __init__(self, bridge: RunLogBridge):
+        super().__init__()
+        self._bridge = bridge
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = record.getMessage()
+            level = getattr(record, 'levelname', 'INFO')
+            # Forward to GUI thread via signal
+            self._bridge.sig_append.emit(msg, level)
+        except Exception:
+            pass
+
 class CameraTestGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.init_styles()
         self.setup_ui_components()
         self.presenter = CameraPresenter(self)
+        # Thread-safe UI invoker and proxy for cross-thread updates during tests
+        self._view_invoker = ViewInvoker(self)
+        self._threadsafe_view_proxy = ThreadSafeViewProxy(self._view_invoker)
         
         # Initialize image update timer
         self.live_timer = QTimer()
@@ -237,10 +306,16 @@ class CameraTestGUI(QMainWindow):
         self.init_live_view_page()
 
         self.stacked_widget.setCurrentWidget(self.welcome_page)
-        
+
         # Set initial splitter sizes (70% main content, 30% log)
         self.splitter.setSizes([int(self.height() * 0.7), int(self.height() * 0.3)])
-        
+
+        # Log prefix state for unified log formatting
+        self._log_prefix = None
+
+    def get_threadsafe_view_proxy(self) -> ThreadSafeViewProxy:
+        return self._threadsafe_view_proxy
+
     def init_welcome_page(self):
         """Initialize welcome page with software description"""
         self.welcome_page = QWidget()
@@ -836,16 +911,20 @@ class CameraTestGUI(QMainWindow):
         # Scroll container (simple vertical container here)
         tests_container = QVBoxLayout()
 
+        # Helper to open setup dialog with proper name/description and runner
+        def setup_runner(name, description, runner):
+            return lambda: self.open_test_setup(name, description, runner)
+
         groups = [
             ("🔧 Basic Camera Tests", "Fundamental camera operations and initialization", [
-                ("Feature Access Test", self.run_feature_tests, "Test camera feature access"),
-                ("Image Acquisition Test", self.run_image_acquisition_test, "Test image capture"),
-                ("Camera Initialization Test", self.run_init_cam_test, "Test camera initialization"),
-                ("Image Quality Test", self.run_image_quality_tests, "Test image quality metrics")
+                ("Feature Access Test", setup_runner("Feature Access", "Verify camera features are readable/writable and report unsupported nodes.", self.presenter.run_feature_tests), "Test camera feature access"),
+                ("Image Acquisition Test", setup_runner("Image Acquisition", "Continuously acquire frames to validate capture stability and stats.", self.presenter.run_image_acquisition_test), "Test image capture"),
+                ("Camera Initialization Test", setup_runner("Camera Initialization", "Sanity-check camera open/grab readiness with a quick test frame.", self.presenter.run_init_cam_test), "Test camera initialization"),
+                ("Image Quality Test", setup_runner("Image Quality", "Capture metrics such as sharpness/contrast/SNR depending on implementation.", self.presenter.run_image_quality_tests), "Test image quality metrics")
             ], self.style_dict['primary']),
             ("⚡ Performance Tests", "Camera performance and speed testing", [
-                ("Max FPS Test", self.run_max_fps_test, "Test maximum frame rate"),
-                ("ROI Test", self.run_roi_test, "Test region of interest functionality"),
+                ("Max FPS Test", setup_runner("Max FPS", "Measure maximum achievable frame rate under current settings.", self.presenter.run_max_fps_test), "Test maximum frame rate"),
+                ("ROI Test", setup_runner("ROI", "Exercise region-of-interest changes and verify captured sizes.", self.presenter.run_roi_test), "Test region of interest functionality"),
                 ("Long Run Test", self.run_long_run_test, "Extended stability testing")
             ], self.style_dict['success']),
             ("🖼️ Image Processing Tests", "Advanced image analysis and processing", [
@@ -1138,9 +1217,59 @@ class CameraTestGUI(QMainWindow):
         """Capture a single image"""
         self.presenter.snap_image()
 
+    def show_captured_image(self, frame):
+        """Show captured frame in the live view area and prompt user to save."""
+        try:
+            # Convert BGR to RGB for display
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame_rgb.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
+            self.image_label.setPixmap(scaled_pixmap)
+
+            # Prompt user to save file (do not auto-save)
+            file_name, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save Captured Image",
+                "",
+                "PNG Image (*.png);;JPEG Image (*.jpg);;RAW Image (*.raw);;All Files (*)"
+            )
+
+            if file_name:
+                # Determine format from selected filter or extension
+                fmt = None
+                if selected_filter and "PNG" in selected_filter:
+                    fmt = 'png'
+                elif selected_filter and ("JPEG" in selected_filter or "JPG" in selected_filter):
+                    fmt = 'jpg'
+                elif selected_filter and "RAW" in selected_filter:
+                    fmt = 'raw'
+                else:
+                    # Use extension
+                    _, ext = os.path.splitext(file_name)
+                    fmt = ext.lstrip('.').lower() or 'png'
+
+                try:
+                    if fmt == 'raw':
+                        # Save raw bytes (BGR numpy array) to file
+                        frame.tofile(file_name)
+                    else:
+                        # Use OpenCV imwrite for common formats
+                        cv2.imwrite(file_name, frame)
+                    self.log_message(f"Captured image saved to {file_name}", "SUCCESS")
+                except Exception as e:
+                    self.show_error("Save Error", f"Failed to save image: {e}")
+        except Exception as e:
+            self.log_message(f"Failed to display captured image: {e}", "ERROR")
+
     def log_message(self, message, level="INFO"):
         """Add a message to the log viewer"""
         timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+        # Apply unified test name prefix if set
+        if getattr(self, '_log_prefix', None):
+            message = f"[{self._log_prefix}] {message}"
         color = {
             "INFO": "black",
             "WARNING": "#FFA500",
@@ -1150,6 +1279,13 @@ class CameraTestGUI(QMainWindow):
         self.log_text.append(html_message)
         # Auto scroll to bottom
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    # Helpers to set/clear log prefix for unified log formatting per test
+    def _set_log_prefix(self, name: str):
+        self._log_prefix = name
+
+    def _clear_log_prefix(self):
+        self._log_prefix = None
 
     def show_error(self, title, message):
         """Show an error dialog with the given title and message"""
@@ -1178,7 +1314,7 @@ class CameraTestGUI(QMainWindow):
         # Buttons row
         buttons = QHBoxLayout()
 
-        back_btn = QPushButton("← Back to Tests")
+        back_btn = QPushButton("Back")
         back_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {self.style_dict['warning']};
@@ -1198,7 +1334,7 @@ class CameraTestGUI(QMainWindow):
         back_btn.clicked.connect(_back)
         buttons.addWidget(back_btn)
 
-        save_std_btn = QPushButton("💾 Save (Standard Name)")
+        save_std_btn = QPushButton("Save Report")
         save_std_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {self.style_dict['success']};
@@ -1214,7 +1350,7 @@ class CameraTestGUI(QMainWindow):
         save_std_btn.clicked.connect(lambda: self._save_with_standard_name(title, results, dialog))
         buttons.addWidget(save_std_btn)
 
-        save_as_btn = QPushButton("📁 Save As...")
+        save_as_btn = QPushButton("Save As…")
         save_as_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {self.style_dict['secondary']};
@@ -1232,7 +1368,7 @@ class CameraTestGUI(QMainWindow):
 
         buttons.addStretch()
 
-        ok_btn = QPushButton("OK")
+        ok_btn = QPushButton("Close")
         ok_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {self.style_dict['primary']};
@@ -1251,6 +1387,16 @@ class CameraTestGUI(QMainWindow):
         main_layout.addLayout(buttons)
         dialog.setLayout(main_layout)
         dialog.exec_()
+
+    def open_test_setup(self, test_name: str, description: str, runner_callable):
+        """Open the pre-test setup dialog with live view on the right and camera controls on the left.
+        Do not start the test until the user clicks Start Test.
+        """
+        try:
+            dlg = TestSetupDialog(self, test_name, description, runner_callable)
+            dlg.exec_()
+        except Exception as e:
+            self.log_message(f"Failed to open test setup for {test_name}: {e}", "ERROR")
         
     def _save_with_standard_name(self, test_name, results, dialog):
         """Save test results using the standardized filename format"""
@@ -1376,6 +1522,16 @@ class CameraTestGUI(QMainWindow):
             self.log_message(error_msg, "ERROR")
             self.show_error("Save Error", error_msg)
             return None
+
+    def show_camera_calibration_dialog(self, genicam_helper, camera_helper):
+        """Open the interactive Camera Calibration dialog and return True if accepted."""
+        try:
+            dlg = CameraCalibrationDialog(self, genicam_helper, camera_helper)
+            res = dlg.exec_()
+            return res == QDialog.Accepted
+        except Exception as e:
+            self.log_message(f"Failed to open calibration dialog: {e}", "ERROR")
+            return False
 
 class CameraConfigDialog(QDialog):
     def __init__(self, parent=None, defaults: dict = None):
@@ -1506,7 +1662,6 @@ class LongRunTestDialog(QDialog):
         self.image_label = QLabel()
         self.image_label.setMinimumSize(400, 300)
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("QLabel { background-color: #000000; }")
         view_layout.addWidget(self.image_label)
         
         view_group.setLayout(view_layout)
@@ -1644,11 +1799,13 @@ class LongRunTestDialog(QDialog):
 
 class TestProgressDialog(QDialog):
     """Progress dialog for showing test execution progress"""
-    def __init__(self, parent=None, test_name="Test", max_steps=100):
+    def __init__(self, parent=None, test_name="Test", max_steps=100, on_cancel=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Running {test_name}")
+        # Title must be the exact test name
+        self.setWindowTitle(test_name)
         self.setFixedSize(500, 200)
         self.setModal(True)
+        self._on_cancel = on_cancel
         
         # Layout
         layout = QVBoxLayout(self)
@@ -1712,7 +1869,15 @@ class TestProgressDialog(QDialog):
                 background-color: #c82333;
             }
         """)
-        self.cancel_button.clicked.connect(self.reject)
+        def _cancel():
+            self.is_cancelled = True
+            try:
+                if callable(self._on_cancel):
+                    self._on_cancel()
+            except Exception:
+                pass
+            self.reject()
+        self.cancel_button.clicked.connect(_cancel)
         layout.addWidget(self.cancel_button)
         
         # State
@@ -1763,8 +1928,1286 @@ class TestProgressDialog(QDialog):
         """Check if test was cancelled"""
         return self.is_cancelled
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    gui = CameraTestGUI()
-    gui.show()
-    sys.exit(app.exec_())
+class _TestWorker(QObject):
+    """Worker to run a callable in a QThread and emit completion."""
+    finished = pyqtSignal(bool, str)  # success, error_message
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+        self._cancel_requested = False
+
+    def cancel(self):
+        # Best-effort flag; underlying test may not support cancellation
+        self._cancel_requested = True
+
+    def run(self):
+        try:
+            # Execute the provided function (presenter method handles UI updates)
+            ok = bool(self._fn())
+            # If cancelled while running, treat as cancelled but success flag False
+            if self._cancel_requested and ok:
+                self.finished.emit(False, "Cancelled by user")
+            else:
+                self.finished.emit(ok, "" if ok else "Test reported failure")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+class TestSetupDialog(QDialog):
+    """Generic pre-test setup dialog with camera controls (left) and live view (right)."""
+    def __init__(self, parent: 'CameraTestGUI', test_name: str, description: str, runner_callable):
+        super().__init__(parent)
+        self.parent = parent
+        self.test_name = test_name
+        self.description = description
+        self.runner_callable = runner_callable
+        self.setWindowTitle(f"Test Setup – {test_name}")
+        self.setMinimumSize(1100, 750)
+
+        # Build UI
+        self._build_ui()
+
+        # Run log bridge and state (after UI is built)
+        self._runlog_bridge = RunLogBridge(self)
+        self._runlog_bridge.sig_append.connect(self._on_bridge_log)
+        self._runlog_max_lines = 1000
+        self._runlog_truncated = False
+        self._last_line_cache = None
+
+        # Start live view immediately for user adjustments
+        try:
+            self.parent.presenter.start_live_view()
+        except Exception:
+            pass
+
+        # Image update timer for right-panel live view
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._update_live_image)
+        self._live_timer.start(33)
+
+        # Default focus on Start Test for accessibility
+        try:
+            self.btn_start.setDefault(True)
+            self.btn_start.setFocus()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
+        # Keep presenter live view state unchanged if tests require streaming; otherwise leave running
+        event.accept()
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+
+        # Left: description + camera settings (reuse calibration widgets pattern)
+        left = QVBoxLayout()
+
+        desc = QGroupBox("Test Description")
+        dlay = QVBoxLayout()
+        lbl = QLabel(self.description)
+        lbl.setWordWrap(True)
+        dlay.addWidget(lbl)
+        desc.setLayout(dlay)
+        left.addWidget(desc)
+
+        settings_group = QGroupBox("Camera Configuration")
+        s_lay = QVBoxLayout()
+
+        # Build controls similar to CameraCalibrationDialog
+        def add_slider_spin(label_text, min_v, max_v, init_v, on_change_cb):
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0,0,0,0)
+            lab = QLabel(label_text)
+            lab.setFixedWidth(140)
+            sl = QSlider(Qt.Horizontal)
+            sl.setMinimum(min_v)
+            sl.setMaximum(max_v)
+            sb = QSpinBox()
+            sb.setRange(min_v, max_v)
+            try:
+                sl.setValue(int(init_v))
+                sb.setValue(int(init_v))
+            except Exception:
+                pass
+            rl.addWidget(lab)
+            rl.addWidget(sl)
+            rl.addWidget(sb)
+            def sync_from_slider(v):
+                try:
+                    sb.blockSignals(True); sb.setValue(int(v)); sb.blockSignals(False)
+                finally:
+                    pass
+                try:
+                    on_change_cb(v)
+                except Exception:
+                    pass
+            def sync_from_spin(v):
+                try:
+                    sl.blockSignals(True); sl.setValue(int(v)); sl.blockSignals(False)
+                finally:
+                    pass
+                try:
+                    on_change_cb(v)
+                except Exception:
+                    pass
+            sl.valueChanged.connect(sync_from_slider)
+            sb.valueChanged.connect(sync_from_spin)
+            s_lay.addWidget(row)
+            return sl, sb
+
+        gh = getattr(self.parent.presenter, 'genicam_helper', None)
+        # Exposure
+        try:
+            cur_exp = int(gh.get_exposure_time()) if gh and hasattr(gh, 'get_exposure_time') else 1000
+        except Exception:
+            cur_exp = 1000
+        add_slider_spin('ExposureTime:', 1, 10000000, cur_exp, lambda v: gh.set_exposure_time(float(v)) if gh and hasattr(gh, 'set_exposure_time') else None)
+
+        # Gain
+        try:
+            cur_gain = int(gh.get_gain()) if gh and hasattr(gh, 'get_gain') else 0
+        except Exception:
+            cur_gain = 0
+        add_slider_spin('Gain:', 0, 300, cur_gain, lambda v: gh.set_gain(float(v)) if gh and hasattr(gh, 'set_gain') else None)
+
+        # White balance
+        add_slider_spin('WhiteBalance:', 0, 5000, 0, lambda v: gh.set_white_balance(float(v)) if gh and hasattr(gh, 'set_white_balance') else None)
+
+        # Gamma (x0.01)
+        add_slider_spin('Gamma(x0.01):', 10, 500, 100, lambda v: gh.set_gamma(float(v)/100.0) if gh and hasattr(gh, 'set_gamma') else None)
+
+        # Pixel format
+        pf_row = QWidget(); pf_lay = QHBoxLayout(pf_row); pf_lay.setContentsMargins(0,0,0,0)
+        pf_lay.addWidget(QLabel('PixelFormat:'))
+        self.pixfmt_combo = QComboBox()
+        try:
+            fmts = gh.get_available_pixel_formats() if gh and hasattr(gh, 'get_available_pixel_formats') else []
+        except Exception:
+            fmts = []
+        self.pixfmt_combo.addItems(fmts)
+        def on_pixfmt():
+            fmt = self.pixfmt_combo.currentText()
+            try:
+                if gh and hasattr(gh, 'set_pixel_format') and fmt:
+                    gh.set_pixel_format(fmt)
+            except Exception:
+                pass
+        self.pixfmt_combo.currentIndexChanged.connect(lambda _: on_pixfmt())
+        pf_lay.addWidget(self.pixfmt_combo)
+        s_lay.addWidget(pf_row)
+
+        # Offsets and ROI
+        try:
+            mx, my = gh.get_max_resolution() if gh and hasattr(gh, 'get_max_resolution') else (10000, 10000)
+            max_w = int(mx); max_h = int(my)
+        except Exception:
+            max_w, max_h = 10000, 10000
+
+        off_row = QWidget(); off_lay = QHBoxLayout(off_row); off_lay.setContentsMargins(0,0,0,0)
+        off_lay.addWidget(QLabel('OffsetX/OffsetY:'))
+        self.offset_x = QSpinBox(); self.offset_y = QSpinBox()
+        self.offset_x.setRange(0, max_w); self.offset_y.setRange(0, max_h)
+        self.offset_x.valueChanged.connect(lambda v: gh.set_offset_x(int(v)) if gh and hasattr(gh, 'set_offset_x') else None)
+        self.offset_y.valueChanged.connect(lambda v: gh.set_offset_y(int(v)) if gh and hasattr(gh, 'set_offset_y') else None)
+        off_lay.addWidget(self.offset_x); off_lay.addWidget(self.offset_y)
+        s_lay.addWidget(off_row)
+
+        roi_row = QWidget(); roi_lay = QHBoxLayout(roi_row); roi_lay.setContentsMargins(0,0,0,0)
+        roi_lay.addWidget(QLabel('ROI W/H:'))
+        self.roi_w = QSpinBox(); self.roi_h = QSpinBox()
+        self.roi_w.setRange(1, max_w); self.roi_h.setRange(1, max_h)
+        self.roi_w.setValue(min(1920, max_w)); self.roi_h.setValue(min(1080, max_h))
+        def on_roi():
+            try:
+                if gh and hasattr(gh, 'set_roi'):
+                    gh.set_roi(int(self.roi_w.value()), int(self.roi_h.value()))
+            except Exception:
+                pass
+        self.roi_w.valueChanged.connect(lambda _: on_roi())
+        self.roi_h.valueChanged.connect(lambda _: on_roi())
+        roi_lay.addWidget(self.roi_w); roi_lay.addWidget(self.roi_h)
+        s_lay.addWidget(roi_row)
+
+        settings_group.setLayout(s_lay)
+        left.addWidget(settings_group)
+
+        # Action row at bottom-left
+        actions = QHBoxLayout()
+        self.btn_start = QPushButton("Start Test")
+        self.btn_start.setStyleSheet(f"background-color: {self.parent.style_dict['primary']}; color: {self.parent.style_dict['white']}; font-weight: bold;")
+        self.btn_start.clicked.connect(self._start_test)
+        actions.addWidget(self.btn_start)
+
+        back_btn = QPushButton("Back")
+        back_btn.clicked.connect(self.reject)
+        actions.addWidget(back_btn)
+
+        actions.addStretch()
+        left.addLayout(actions)
+
+        # Add left panel to root
+        left_w = QWidget(); left_w.setLayout(left)
+        root.addWidget(left_w, 4)
+
+        # Right: Live view
+        right = QVBoxLayout()
+        grp = QGroupBox("Live View")
+        vlay = QVBoxLayout()
+        self.live_label = QLabel()
+        self.live_label.setMinimumSize(640, 480)
+        self.live_label.setAlignment(Qt.AlignCenter)
+        self.live_label.setStyleSheet('background-color: black;')
+        vlay.addWidget(self.live_label)
+        grp.setLayout(vlay)
+        right.addWidget(grp)
+
+        # Run Log console below live view
+        log_group = QGroupBox("Run Log")
+        lglay = QVBoxLayout()
+
+        # Live indicator row
+        ind_row = QHBoxLayout()
+        self.live_indicator = QLabel("● Live")
+        self.live_indicator.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.live_indicator.setVisible(False)
+        ind_row.addWidget(self.live_indicator)
+        ind_row.addStretch()
+        # Copy/Save buttons
+        self.btn_copy_all = QPushButton("Copy All")
+        self.btn_copy_all.clicked.connect(self._copy_all_log)
+        ind_row.addWidget(self.btn_copy_all)
+        self.btn_save_log = QPushButton("Save Log…")
+        self.btn_save_log.clicked.connect(self._save_log)
+        ind_row.addWidget(self.btn_save_log)
+        lglay.addLayout(ind_row)
+
+        # Text console
+        from PyQt5.QtWidgets import QTextEdit
+        self.run_log_text = QTextEdit()
+        self.run_log_text.setReadOnly(True)
+        self.run_log_text.setLineWrapMode(QTextEdit.NoWrap)
+        self.run_log_text.setMinimumHeight(160)
+        self.run_log_text.setStyleSheet("QTextEdit { font-family: 'Consolas', 'Courier New', monospace; }")
+        lglay.addWidget(self.run_log_text)
+
+        log_group.setLayout(lglay)
+        right.addWidget(log_group)
+        right.addStretch()
+        right_w = QWidget(); right_w.setLayout(right)
+        root.addWidget(right_w, 6)
+        self.setLayout(root)
+
+    def _update_live_image(self):
+        frame = self.parent.presenter.get_current_frame()
+        if frame is None:
+            return
+        try:
+            frm = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frm.shape
+            bytes_per_line = ch * w
+            qimg = QImage(frm.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(self.live_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.live_label.setPixmap(pix)
+        except Exception:
+            pass
+
+    def _start_test(self):
+        # Prefix logs with test name
+        self.parent._set_log_prefix(self.test_name)
+        self.parent.log_message("Starting test…", "INFO")
+
+        # Show standardized progress dialog (indeterminate by default)
+        self._progress = TestProgressDialog(self, test_name=self.test_name, max_steps=0, on_cancel=self._on_cancel)
+        self._progress.set_progress_range(0, 0)  # Indeterminate
+        self._progress.update_status("Running…")
+
+        # Prepare run log console
+        self.run_log_text.clear()
+        self._runlog_truncated = False
+        self._last_line_cache = None
+        self.live_indicator.setVisible(True)
+
+        # Freeze live view image and stop grabbing to avoid conflicts with tests starting acquisition
+        try:
+            # Grab last frame to display while test runs
+            frame = self.parent.presenter.get_current_frame()
+            if frame is not None:
+                frm = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = frm.shape
+                bytes_per_line = ch * w
+                qimg = QImage(frm.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                pix = QPixmap.fromImage(qimg).scaled(self.live_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.live_label.setPixmap(pix)
+        except Exception:
+            pass
+        try:
+            # Stop our periodic updates and presenter's live grabbing
+            self._live_timer.stop()
+            if getattr(self.parent.presenter, 'is_live_grabbing', False):
+                self.parent.presenter.stop_live_view()
+        except Exception:
+            pass
+
+        # Swap presenter's view to thread-safe proxy so worker can safely trigger GUI updates
+        try:
+            self._orig_view = self.parent.presenter.view
+            proxy = self.parent.get_threadsafe_view_proxy()
+            self.parent.presenter.view = proxy
+            # Also mirror view.log_message to this dialog run log
+            proxy.attach_run_log(self._runlog_bridge)
+        except Exception:
+            self._orig_view = None
+
+        # Install logging handler to forward logger output to the run log
+        import logging as _logging
+        self._log_handler = UITestRunHandler(self._runlog_bridge)
+        self._log_handler.setLevel(_logging.DEBUG)
+        _logging.getLogger().addHandler(self._log_handler)
+
+        # Launch worker thread to run the provided callable
+        self._thread = QThread()
+        self._worker = _TestWorker(self.runner_callable)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+        self._progress.exec_()
+
+    def _on_cancel(self):
+        try:
+            if hasattr(self, '_worker'):
+                self._worker.cancel()
+            # Best-effort: stop live grabbing if running to release camera for tests
+            # but keep right panel live for other flows as required
+        except Exception:
+            pass
+        # Immediate cancellation line in both consoles
+        self._append_run_log("Cancelled by user", "WARNING")
+        self.parent.log_message("Cancelled by user", "WARNING")
+
+    def _on_finished(self, success: bool, error_message: str):
+        try:
+            if hasattr(self, '_progress') and self._progress:
+                if success:
+                    self._progress.complete()
+                # Close the progress dialog regardless
+                self._progress.close()
+        except Exception:
+            pass
+
+        # Clear log prefix after completion/cancel
+        self.parent._clear_log_prefix()
+
+        # Restore original presenter view
+        try:
+            if getattr(self, '_orig_view', None) is not None:
+                self.parent.presenter.view = self._orig_view
+            # Detach run log mirroring
+            self.parent.get_threadsafe_view_proxy().detach_run_log()
+        except Exception:
+            pass
+
+        # Remove logging handler
+        try:
+            import logging as _logging
+            if getattr(self, '_log_handler', None) is not None:
+                _logging.getLogger().removeHandler(self._log_handler)
+                self._log_handler = None
+        except Exception:
+            pass
+
+        # Show concise completion summary
+        try:
+            if success:
+                QMessageBox.information(self, self.test_name, f"{self.test_name} completed successfully.")
+                self._append_run_log("Completed successfully.", "SUCCESS")
+            else:
+                # Treat cancel differently from failure based on message
+                if error_message and 'cancel' in error_message.lower():
+                    QMessageBox.information(self, self.test_name, f"{self.test_name} was cancelled.")
+                    self._append_run_log("Cancelled by user", "WARNING")
+                else:
+                    QMessageBox.warning(self, self.test_name, f"{self.test_name} failed.\n\n{error_message or ''}")
+                    if error_message:
+                        self._append_run_log(error_message, "ERROR")
+        except Exception:
+            pass
+
+        # Optionally restore live view for further adjustments
+        try:
+            self.parent.presenter.start_live_view()
+            self._live_timer.start(33)
+        except Exception:
+            pass
+
+        # Turn off live indicator
+        try:
+            self.live_indicator.setVisible(False)
+        except Exception:
+            pass
+
+        # Summarize and log
+        if success:
+            self.parent.log_message("Completed successfully.", "SUCCESS")
+        else:
+            # If cancelled, error_message may be "Cancelled by user"
+            self.parent.log_message(f"Finished with status: {error_message or 'Failed'}", "ERROR" if error_message and 'cancel' not in error_message.lower() else "WARNING")
+
+        # Note: Detailed results are shown by presenter via update_test_results.
+        # Keep setup dialog open to allow user to adjust further or close.
+
+    # ---------- Run Log console helpers ----------
+    def _on_bridge_log(self, message: str, level: str):
+        # From GUI thread via signal; append to console and mirror to System Log
+        self._append_run_log(message, level)
+        # Also append to global System Log viewer with prefix applied there
+        try:
+            self.parent.log_message(message, level)
+        except Exception:
+            pass
+
+    def _append_run_log(self, message: str, level: str = "INFO"):
+        try:
+            # Deduplicate immediate repeats
+            line_key = f"{level}|{message}"
+            if line_key == self._last_line_cache:
+                return
+            self._last_line_cache = line_key
+
+            # Truncate long lines
+            max_len = 2000
+            if len(message) > max_len:
+                message = message[:max_len] + "…"
+
+            # Soft cap on number of lines
+            doc = self.run_log_text.document()
+            total_blocks = doc.blockCount()
+            if total_blocks >= self._runlog_max_lines:
+                if not self._runlog_truncated:
+                    # Insert a one-time notice
+                    notice = "(older lines truncated)"
+                    self._append_html_line(self._format_html('INFO', notice))
+                    self._runlog_truncated = True
+                # Remove first block by reconstructing minimal content: clear and rebuild last N-1? Simpler: just clear and add notice
+                self.run_log_text.clear()
+                self._append_html_line(self._format_html('INFO', "(older lines truncated)"))
+
+            # Determine color by level
+            lvl = (level or "INFO").upper()
+            # Prefix with test name
+            test_prefix = f"[{self.test_name}] "
+            ts = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+            disp = f"{test_prefix}{message}"
+            html = self._format_html(lvl, disp, ts)
+
+            # Auto-scroll behavior: keep if already at bottom
+            sb = self.run_log_text.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 2
+            self._append_html_line(html)
+            if at_bottom:
+                sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+    def _format_html(self, level: str, text: str, ts: str = None) -> str:
+        color = {
+            "INFO": "black",
+            "WARNING": "#FFA500",
+            "ERROR": "red",
+            "SUCCESS": "green",
+            "DEBUG": "#666666",
+        }.get(level.upper(), "black")
+        ts = ts or QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+        return f'<p style="margin:0; white-space: pre;">' \
+               f'<span style="color:#666;">{ts}</span> ' \
+               f'<span style="color:{color};">[{level.upper()}]</span> ' \
+               f'{self._escape_html(text)}</p>'
+
+    def _append_html_line(self, html: str):
+        self.run_log_text.append(html)
+
+    def _escape_html(self, s: str) -> str:
+        return (s.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+                 .replace('"', "&quot;")
+                 .replace("'", "&#39;"))
+
+    def _copy_all_log(self):
+        try:
+            self.run_log_text.selectAll()
+            self.run_log_text.copy()
+            # Clear selection to avoid highlighting
+            cursor = self.run_log_text.textCursor()
+            cursor.clearSelection()
+            self.run_log_text.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _save_log(self):
+        try:
+            ts = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+            default_name = f"{self.test_name.replace(' ', '')}_RunLog_{ts}.txt"
+            path, _ = QFileDialog.getSaveFileName(self, "Save Run Log", default_name, "Text Files (*.txt);;All Files (*)")
+            if path:
+                # Save plain text (without HTML tags)
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(self.run_log_text.toPlainText())
+                try:
+                    self.parent.log_message(f"Run log saved to {path}", "SUCCESS")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+class CameraCalibrationDialog(QDialog):
+    def __init__(self, parent, genicam_helper, camera_helper):
+        super().__init__(parent)
+        self.setWindowTitle("Camera Calibration - ISO12233 Matching")
+        self.setMinimumSize(1100, 750)
+        self.genicam_helper = genicam_helper
+        self.camera_helper = camera_helper
+        self.live_frame = None
+        self.captured_frame = None
+        self.chart_image = None
+        self._live_enabled = False
+        self._zoom = 1.0
+        self._pan_enabled = False
+        self._pan_offset = QPoint(0, 0)
+        self._mouse_last = None
+        self._load_chart()
+        self._build_ui()
+        # Ensure Start button and live placeholder are visible/enabled
+        try:
+            if hasattr(self, 'btn_start_capture'):
+                self.btn_start_capture.setVisible(True)
+                self.btn_start_capture.setEnabled(True)
+                try:
+                    self.parent().log_message('Start Calibration mode button present in dialog', 'INFO')
+                except Exception:
+                    pass
+            if hasattr(self, 'live_label'):
+                # make sure the placeholder text is visible
+                try:
+                    self.live_label.setText(self.live_label.text() or 'Live view (stopped)')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _load_chart(self):
+        # Try multiple locations to find the chart
+        candidates = [
+            os.path.abspath(os.path.join(os.getcwd(), 'data', 'calibration_files')),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'calibration_files')),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'calibration_files')),
+            os.path.abspath(os.path.join(os.getcwd(), '..', 'data', 'calibration_files')),
+        ]
+        fname_variants = ['ISO12233_Test chart.PNG', 'ISO12233_Test chart.png', 'ISO12233_Test_chart.PNG', 'ISO12233_Test_chart.png']
+        path = None
+        for base in candidates:
+            for fn in fname_variants:
+                p = os.path.join(base, fn)
+                if os.path.exists(p):
+                    path = p
+                    break
+            if path:
+                break
+        if not path:
+            try:
+                self.parent().log_message('ISO12233 chart not found; showing chart placeholder', 'WARNING')
+            except Exception:
+                pass
+            self.chart_image = None
+            return
+        img = cv2.imread(path)
+        if img is None:
+            try:
+                self.parent().log_message(f'Failed to load chart image at {path}', 'ERROR')
+            except Exception:
+                pass
+            self.chart_image = None
+            return
+        self.chart_image = img
+        try:
+            self.parent().log_message(f'Loaded calibration chart from {path}', 'INFO')
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        instr = QLabel(
+            "1) Place the printed ISO12233 chart in the camera FOV so it fills the frame.\n"
+            "2) Click 'Start calibration mode' to start the camera live view.\n"
+            "3) Use the live view controls to adjust exposure/gain/pixel format/white balance/gamma/offset/ROI.\n"
+            "4) Hover over the live image to see (x,y) and gray value. Use zoom/pan tools as needed.\n"
+            "5) Save configuration to camera or cancel."
+        )
+        instr.setWordWrap(True)
+        layout.addWidget(instr)
+
+        # Chart only initially; live preview hidden until Start
+        top = QHBoxLayout()
+        self.chart_label = QLabel()
+        self.chart_label.setFixedSize(500, 400)
+        if self.chart_image is not None:
+            self._set_label_image(self.chart_label, self.chart_image)
+        else:
+            self.chart_label.setText('ISO12233 chart not found')
+            self.chart_label.setAlignment(Qt.AlignCenter)
+        top.addWidget(self.chart_label)
+
+        # Right column for controls and live/toolbar
+        right_col = QVBoxLayout()
+
+        # Live view container (hidden until start)
+        self.live_container = QWidget()
+        live_layout = QVBoxLayout(self.live_container)
+        self.live_label = QLabel()
+        self.live_label.setFixedSize(640, 480)
+        self.live_label.setAlignment(Qt.AlignCenter)
+        self.live_label.setStyleSheet('background-color: black; border: 1px solid #333;')
+        self.live_label.setMouseTracking(True)
+        self.live_label.installEventFilter(self)
+        # Show placeholder text so live view area is visible even when not grabbing
+        self.live_label.setText('Live view (stopped)')
+        self.live_label.setStyleSheet('color: #cccccc; background-color: #000000; border: 1px solid #333; font-family: Consolas, monospace;')
+        live_layout.addWidget(self.live_label)
+
+        # Toolbar: Zoom In/Out, Pan toggle, Reset (Start button moved to configuration row)
+        toolbar = QHBoxLayout()
+        # NOTE: 'Start Calibration mode' button intentionally moved to the configuration
+        # button row (so it's beside Save/Cancel). Keep toolbar limited to view controls.
+
+        self.btn_zoom_in = QPushButton('Zoom +')
+        self.btn_zoom_in.clicked.connect(lambda: self._change_zoom(1.25))
+        toolbar.addWidget(self.btn_zoom_in)
+        self.btn_zoom_out = QPushButton('Zoom -')
+        self.btn_zoom_out.clicked.connect(lambda: self._change_zoom(0.8))
+        toolbar.addWidget(self.btn_zoom_out)
+        self.btn_pan = QPushButton('Pan')
+        self.btn_pan.setCheckable(True)
+        self.btn_pan.toggled.connect(self._toggle_pan)
+        toolbar.addWidget(self.btn_pan)
+        self.btn_reset = QPushButton('Reset View')
+        self.btn_reset.clicked.connect(self._reset_view)
+        toolbar.addWidget(self.btn_reset)
+
+        live_layout.addLayout(toolbar)
+
+        # Pixel info label
+        self.pixel_info = QLabel('x,y: -   gray: -')
+        live_layout.addWidget(self.pixel_info)
+
+        # Keep live container visible but controls disabled until Start pressed
+        self.live_container.setVisible(True)
+        right_col.addWidget(self.live_container)
+
+        # Initially disable live-control widgets until live preview is started
+        try:
+            self.exposure_slider.setEnabled(False)
+            self.exposure_spin.setEnabled(False)
+            self.gain_slider.setEnabled(False)
+            self.gain_spin.setEnabled(False)
+            self.wb_slider.setEnabled(False)
+            self.wb_spin.setEnabled(False)
+            self.gamma_slider.setEnabled(False)
+            self.gamma_spin.setEnabled(False)
+            self.pixfmt_combo.setEnabled(False)
+            self.offset_x_spin.setEnabled(False)
+            self.offset_y_spin.setEnabled(False)
+            self.roi_w_spin.setEnabled(False)
+            self.roi_h_spin.setEnabled(False)
+            self.btn_zoom_in.setEnabled(False)
+            self.btn_zoom_out.setEnabled(False)
+            self.btn_pan.setEnabled(False)
+            self.btn_reset.setEnabled(False)
+        except Exception:
+            pass
+        control_group = QGroupBox('Camera Settings (live control)')
+        control_layout = QVBoxLayout()
+
+        def add_slider_with_spin(label_text, slider, spinbox, on_slider_cb=None, on_spin_cb=None, spin_range=(0, 10000)):
+            row = QWidget()
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(0,0,0,0)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(120)
+            row_l.addWidget(lbl)
+            row_l.addWidget(slider)
+            spinbox.setRange(spin_range[0], spin_range[1])
+            spinbox.setFixedWidth(100)
+            row_l.addWidget(spinbox)
+            if on_slider_cb:
+                slider.valueChanged.connect(on_slider_cb)
+            if on_spin_cb:
+                spinbox.valueChanged.connect(on_spin_cb)
+            control_layout.addWidget(row)
+            return row
+
+        # Exposure
+        self.exposure_slider = QSlider(Qt.Horizontal)
+        self.exposure_slider.setMinimum(1)
+        self.exposure_slider.setMaximum(10000000)
+        self.exposure_spin = QSpinBox()
+        try:
+            cur = int(self.genicam_helper.get_exposure_time()) if hasattr(self.genicam_helper, 'get_exposure_time') else 1000
+        except Exception:
+            cur = 1000
+        self.exposure_slider.setValue(cur)
+        self.exposure_spin.setValue(cur)
+        add_slider_with_spin('ExposureTime:', self.exposure_slider, self.exposure_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.exposure_slider, self.exposure_spin, v, self._on_exposure_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.exposure_spin, self.exposure_slider, v, self._on_exposure_change),
+                             spin_range=(1, 10000000))
+
+        # Gain
+        self.gain_slider = QSlider(Qt.Horizontal)
+        self.gain_slider.setMinimum(0)
+        self.gain_slider.setMaximum(300)
+        self.gain_spin = QSpinBox()
+        try:
+            gcur = int(self.genicam_helper.get_gain()) if hasattr(self.genicam_helper, 'get_gain') else 0
+        except Exception:
+            gcur = 0
+        self.gain_slider.setValue(gcur)
+        self.gain_spin.setValue(gcur)
+        add_slider_with_spin('Gain:', self.gain_slider, self.gain_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.gain_slider, self.gain_spin, v, self._on_gain_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.gain_spin, self.gain_slider, v, self._on_gain_change),
+                             spin_range=(0, 300))
+
+        # White balance
+        self.wb_slider = QSlider(Qt.Horizontal)
+        self.wb_slider.setMinimum(0)
+        self.wb_slider.setMaximum(5000)
+        self.wb_spin = QSpinBox()
+        self.wb_spin.setValue(0)
+        add_slider_with_spin('WhiteBalance:', self.wb_slider, self.wb_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.wb_slider, self.wb_spin, v, self._on_white_balance_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.wb_spin, self.wb_slider, v, self._on_white_balance_change),
+                             spin_range=(0, 5000))
+
+        # Gamma (scaled by 100)
+        self.gamma_slider = QSlider(Qt.Horizontal)
+        self.gamma_slider.setMinimum(10)
+        self.gamma_slider.setMaximum(500)
+        self.gamma_spin = QSpinBox()
+        self.gamma_spin.setRange(10, 500)
+        self.gamma_spin.setValue(100)
+        add_slider_with_spin('Gamma(x0.01):', self.gamma_slider, self.gamma_spin,
+                             on_slider_cb=lambda v: self._sync_slider_spin(self.gamma_slider, self.gamma_spin, v, self._on_gamma_change),
+                             on_spin_cb=lambda v: self._sync_spin_slider(self.gamma_spin, self.gamma_slider, v, self._on_gamma_change),
+                             spin_range=(10, 500))
+
+        # Pixel format combo (show current and allow selection)
+        pf_row = QWidget()
+        pf_layout = QHBoxLayout(pf_row)
+        pf_layout.setContentsMargins(0,0,0,0)
+        pf_label = QLabel('PixelFormat:')
+        pf_label.setFixedWidth(120)
+        self.pixfmt_combo = QComboBox()
+        try:
+            fmts = self.genicam_helper.get_available_pixel_formats() if hasattr(self.genicam_helper, 'get_available_pixel_formats') else []
+        except Exception:
+            fmts = []
+        self.pixfmt_combo.addItems(fmts)
+        pf_layout.addWidget(pf_label)
+        pf_layout.addWidget(self.pixfmt_combo)
+        control_layout.addWidget(pf_row)
+        self.pixfmt_combo.currentIndexChanged.connect(self._on_pixfmt_change)
+
+        # Offsets and ROI with spinboxes (no sliders)
+        off_row = QWidget()
+        off_layout = QHBoxLayout(off_row)
+        off_layout.setContentsMargins(0,0,0,0)
+        off_label = QLabel('OffsetX/OffsetY:')
+        off_label.setFixedWidth(120)
+        self.offset_x_spin = QSpinBox()
+        self.offset_y_spin = QSpinBox()
+        try:
+            mx, mh = self.genicam_helper.get_max_resolution() if hasattr(self.genicam_helper, 'get_max_resolution') else (10000,10000)
+            max_w = int(mx)
+            max_h = int(mh)
+        except Exception:
+            max_w = 10000
+            max_h = 10000
+        self.offset_x_spin.setRange(0, max_w)
+        self.offset_y_spin.setRange(0, max_h)
+        off_layout.addWidget(off_label)
+        off_layout.addWidget(self.offset_x_spin)
+        off_layout.addWidget(self.offset_y_spin)
+        control_layout.addWidget(off_row)
+        self.offset_x_spin.valueChanged.connect(self._on_offset_x_change)
+        self.offset_y_spin.valueChanged.connect(self._on_offset_y_change)
+
+        roi_row = QWidget()
+        roi_layout = QHBoxLayout(roi_row)
+        roi_layout.setContentsMargins(0,0,0,0)
+        roi_label = QLabel('ROI W/H:')
+        roi_label.setFixedWidth(120)
+        self.roi_w_spin = QSpinBox()
+        self.roi_h_spin = QSpinBox()
+        self.roi_w_spin.setRange(1, max_w)
+        self.roi_h_spin.setRange(1, max_h)
+        self.roi_w_spin.setValue(min(1920, max_w))
+        self.roi_h_spin.setValue(min(1080, max_h))
+        roi_layout.addWidget(roi_label)
+        roi_layout.addWidget(self.roi_w_spin)
+        roi_layout.addWidget(self.roi_h_spin)
+        control_layout.addWidget(roi_row)
+        self.roi_w_spin.valueChanged.connect(self._on_roi_change)
+        self.roi_h_spin.valueChanged.connect(self._on_roi_change)
+
+        control_group.setLayout(control_layout)
+        right_col.addWidget(control_group)
+
+        # Save / Start / Cancel row: Start button placed beside Save and Cancel
+        bottom_h = QHBoxLayout()
+
+        # Start Calibration Mode (moved here from the live toolbar)
+        self.btn_start_capture = QPushButton('Start Calibration mode')
+        try:
+            self.btn_start_capture.setMinimumWidth(180)
+            self.btn_start_capture.setStyleSheet(f"background-color: {self.style_dict['primary']}; color: {self.style_dict['white']}; padding: 8px; border-radius: 6px;")
+            self.btn_start_capture.setEnabled(True)
+        except Exception:
+            pass
+        self.btn_start_capture.clicked.connect(self._on_start_or_capture)
+        bottom_h.addWidget(self.btn_start_capture)
+
+        # Save configuration
+        self.btn_save_cfg = QPushButton('Save configuration to camera')
+        self.btn_save_cfg.clicked.connect(self._on_save_configuration)
+        self.btn_save_cfg.setEnabled(False)
+        bottom_h.addWidget(self.btn_save_cfg)
+
+        # Cancel / Back
+        self.btn_cancel = QPushButton('Do not save, back to main')
+        self.btn_cancel.clicked.connect(self.reject)
+        bottom_h.addWidget(self.btn_cancel)
+
+        # Keep spacing consistent with other dialogs
+        bottom_h.addStretch()
+        right_col.addLayout(bottom_h)
+
+        top.addLayout(right_col)
+        layout.addLayout(top)
+
+        self.setLayout(layout)
+
+        # Timer for live preview (not started until Start clicked)
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._update_live_preview)
+
+    # Utility helpers
+    def _sync_slider_spin(self, slider, spin, value, cb):
+        try:
+            spin.blockSignals(True)
+            spin.setValue(int(value))
+            spin.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            cb(value)
+        except Exception:
+            pass
+
+    def _sync_spin_slider(self, spin, slider, value, cb):
+        try:
+            slider.blockSignals(True)
+            slider.setValue(int(value))
+            slider.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            cb(value)
+        except Exception:
+            pass
+
+    def _on_start_or_capture(self):
+        # If not live, start live view; otherwise capture current frame
+        if not self._live_enabled:
+            # Start presenter live view so camera starts streaming
+            try:
+                if hasattr(self.parent(), 'presenter'):
+                    self.parent().presenter.start_live_view()
+            except Exception:
+                pass
+
+            self._live_enabled = True
+
+            # enable live controls
+            try:
+                self.exposure_slider.setEnabled(True)
+                self.exposure_spin.setEnabled(True)
+                self.gain_slider.setEnabled(True)
+                self.gain_spin.setEnabled(True)
+                self.wb_slider.setEnabled(True)
+                self.wb_spin.setEnabled(True)
+                self.gamma_slider.setEnabled(True)
+                self.gamma_spin.setEnabled(True)
+                self.pixfmt_combo.setEnabled(True)
+                self.offset_x_spin.setEnabled(True)
+                self.offset_y_spin.setEnabled(True)
+                self.roi_w_spin.setEnabled(True)
+                self.roi_h_spin.setEnabled(True)
+                self.btn_zoom_in.setEnabled(True)
+                self.btn_zoom_out.setEnabled(True)
+                self.btn_pan.setEnabled(True)
+                self.btn_reset.setEnabled(True)
+            except Exception:
+                pass
+
+            self._live_timer.start(100)
+            self.btn_start_capture.setText('Capture')
+            try:
+                self.parent().log_message('Live view started for calibration', 'INFO')
+            except Exception:
+                pass
+            return
+
+        # Already live -> Capture a frame
+        try:
+            frame = None
+            if hasattr(self.parent(), 'presenter'):
+                frame = self.parent().presenter.get_current_frame()
+            if frame is None and self.camera_helper:
+                try:
+                    frame = self.camera_helper.get_frame(self.camera_helper.camera, timeout_ms=1000)
+                except Exception:
+                    frame = None
+            if frame is None:
+                try:
+                    self.parent().log_message('Failed to capture image during calibration', 'ERROR')
+                except Exception:
+                    pass
+                return
+            # Store captured frame and show it briefly (no side-by-side)
+            self.captured_frame = frame
+            self._display_live_frame(frame)
+            self.btn_save_cfg.setEnabled(True)
+            try:
+                self.parent().log_message('Captured calibration image', 'INFO')
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f'Capture failed: {e}', 'ERROR')
+            except Exception:
+                pass
+
+    def _update_live_preview(self):
+        try:
+            frame = None
+            if hasattr(self.parent(), 'presenter'):
+                frame = self.parent().presenter.get_current_frame()
+            if frame is None and self.camera_helper:
+                frame = self.camera_helper.get_frame(self.camera_helper.camera, timeout_ms=200)
+            if frame is not None:
+                self.live_frame = frame
+                self._display_live_frame(frame)
+        except Exception as e:
+            try:
+                self.parent().log_message(f'Live preview error: {e}', 'WARNING')
+            except Exception:
+                pass
+
+    def _display_live_frame(self, frame):
+        # Render frame to live_label honoring zoom and pan
+        try:
+            img = frame.copy()
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
+            # Create QImage
+            bytes_per_line = 3 * w
+            qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg)
+            # Apply zoom
+            if self._zoom != 1.0:
+                pix = pix.scaled(int(pix.width() * self._zoom), int(pix.height() * self._zoom), Qt.KeepAspectRatio)
+            # Create canvas and draw at pan offset
+            canvas = QPixmap(self.live_label.size())
+            canvas.fill(Qt.black)
+            painter = QPainter(canvas)
+            # compute top-left based on pan offset
+            tx = self._pan_offset.x()
+            ty = self._pan_offset.y()
+            painter.drawPixmap(tx, ty, pix)
+            painter.end()
+            self.live_label.setPixmap(canvas)
+        except Exception:
+            try:
+                self.parent().log_message('Failed to display live frame', 'WARNING')
+            except Exception:
+                pass
+
+    def eventFilter(self, obj, event):
+        # Mouse movement on live_label -> show coordinates and gray value
+        if obj is self.live_label and event.type() == QEvent.MouseMove:
+            pos = event.pos()
+            self._handle_mouse_move(pos)
+            if self._pan_enabled and event.buttons() & Qt.LeftButton:
+                if self._mouse_last is not None:
+                    delta = pos - self._mouse_last
+                    self._pan_offset += delta
+                self._mouse_last = pos
+            return True
+        if obj is self.live_label and event.type() == QEvent.MouseButtonPress:
+            if self._pan_enabled and event.button() == Qt.LeftButton:
+                self._mouse_last = event.pos()
+                return True
+        if obj is self.live_label and event.type() == QEvent.MouseButtonRelease:
+            if self._pan_enabled and event.button() == Qt.LeftButton:
+                self._mouse_last = None
+                return True
+        return super().eventFilter(obj, event)
+
+    def _handle_mouse_move(self, pos):
+        try:
+            # Map label coordinates to the actual live_frame image coordinates
+            if self.live_frame is None:
+                return
+            img = self.live_frame
+            h, w = img.shape[:2]
+            lbl_w = self.live_label.width()
+            lbl_h = self.live_label.height()
+            # Determine scale used (we used KeepAspectRatio when drawing pixmap)
+            scale = min(lbl_w / (w * self._zoom), lbl_h / (h * self._zoom))
+            disp_w = int(w * self._zoom * scale)
+            disp_h = int(h * self._zoom * scale)
+            x_off = max(0, (lbl_w - disp_w) // 2 + self._pan_offset.x())
+            y_off = max(0, (lbl_h - disp_h) // 2 + self._pan_offset.y())
+            # compute image coordinates
+            ix = int((pos.x() - x_off) / (self._zoom * scale))
+            iy = int((pos.y() - y_off) / (self._zoom * scale))
+            if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                self.pixel_info.setText('x,y: -   gray: -')
+                return
+            # get gray value
+            gray = int(np.mean(img[iy, ix]))
+            self.pixel_info.setText(f'x,y: {ix},{iy}   gray: {gray}')
+        except Exception:
+            pass
+
+    def _change_zoom(self, factor):
+        try:
+            self._zoom = max(0.1, min(10.0, self._zoom * factor))
+            if self.live_frame is not None:
+                self._display_live_frame(self.live_frame)
+        except Exception:
+            pass
+
+    def _toggle_pan(self, on):
+        self._pan_enabled = bool(on)
+        if not on:
+            self._mouse_last = None
+
+    def _reset_view(self):
+        self._zoom = 1.0
+        self._pan_offset = QPoint(0,0)
+        if self.live_frame is not None:
+            self._display_live_frame(self.live_frame)
+
+    # ...existing settings handlers (use same names) ...
+    def _on_exposure_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_exposure_time'):
+                self.genicam_helper.set_exposure_time(float(val))
+                try:
+                    self.parent().log_message(f"Set ExposureTime to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set ExposureTime: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_gain_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_gain'):
+                self.genicam_helper.set_gain(float(val))
+                try:
+                    self.parent().log_message(f"Set Gain to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set Gain: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_white_balance_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_white_balance'):
+                self.genicam_helper.set_white_balance(float(val))
+                try:
+                    self.parent().log_message(f"Set WhiteBalance to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set WhiteBalance: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_gamma_change(self, val):
+        try:
+            gamma_val = float(val) / 100.0
+            if hasattr(self.genicam_helper, 'set_gamma'):
+                self.genicam_helper.set_gamma(float(gamma_val))
+                try:
+                    self.parent().log_message(f"Set Gamma to {gamma_val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set Gamma: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_pixfmt_change(self, idx):
+        try:
+            fmt = self.pixfmt_combo.currentText()
+            if fmt and hasattr(self.genicam_helper, 'set_pixel_format'):
+                self.genicam_helper.set_pixel_format(fmt)
+                try:
+                    self.parent().log_message(f"Set PixelFormat to {fmt}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set PixelFormat: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_offset_x_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_offset_x'):
+                self.genicam_helper.set_offset_x(int(val))
+                try:
+                    self.parent().log_message(f"Set OffsetX to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set OffsetX: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_offset_y_change(self, val):
+        try:
+            if hasattr(self.genicam_helper, 'set_offset_y'):
+                self.genicam_helper.set_offset_y(int(val))
+                try:
+                    self.parent().log_message(f"Set OffsetY to {val}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set OffsetY: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_roi_change(self):
+        try:
+            w = int(self.roi_w_spin.value())
+            h = int(self.roi_h_spin.value())
+            if hasattr(self.genicam_helper, 'set_roi'):
+                self.genicam_helper.set_roi(w, h)
+                try:
+                    self.parent().log_message(f"Set ROI to {w}x{h}", "DEBUG")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Failed to set ROI: {e}", "WARNING")
+            except Exception:
+                pass
+
+    def _on_save_configuration(self):
+        try:
+            if self.genicam_helper is None:
+                raise RuntimeError("GenICam helper not available")
+            try:
+                if self.genicam_helper.has_node('UserSetSelector') and self.genicam_helper.has_node('UserSetLoad'):
+                    try:
+                        self.genicam_helper.set_node_value('UserSetSelector', 1)
+                        save_node = self.genicam_helper._get_node('UserSetSave')
+                        if save_node is not None and hasattr(save_node, 'Execute'):
+                            save_node.Execute()
+                        elif hasattr(save_node, 'SetValue'):
+                            save_node.SetValue(1)
+                    except Exception as e:
+                        try:
+                            self.parent().log_message(f"Failed to write user setting via nodes: {e}", "WARNING")
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.parent().log_message("Camera does not support UserSet save via GenICam nodes; skipping actual save", "WARNING")
+                    except Exception:
+                        pass
+                try:
+                    self.parent().log_message("Configuration saved to camera (if supported)", "SUCCESS")
+                except Exception:
+                    pass
+                self.accept()
+            except Exception as e:
+                try:
+                    self.parent().log_message(f"Failed to save configuration: {e}", "ERROR")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.parent().log_message(f"Save configuration error: {e}", "ERROR")
+            except Exception:
+                pass
+
+    def show_modal(self):
+        return self.exec_()
+
+    def _set_label_image(self, label, frame):
+        try:
+            if frame is None:
+                label.clear()
+                return
+            # ensure BGR
+            img = frame
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            # Convert to RGB for Qt
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
+            bytes_per_line = 3 * w
+            qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(label.size(), Qt.KeepAspectRatio)
+            label.setPixmap(pix)
+        except Exception:
+            try:
+                self.parent().log_message('Failed to set label image', 'WARNING')
+            except Exception:
+                pass
+
+    def show_camera_calibration_dialog(self, genicam_helper, camera_helper):
+        """Factory to show CameraCalibrationDialog from the presenter."""
+        try:
+            dlg = CameraCalibrationDialog(self, genicam_helper, camera_helper)
+            res = dlg.exec_()
+            return res == QDialog.Accepted
+        except Exception as e:
+            self.log_message(f"Failed to open calibration dialog: {e}", "ERROR")
+            return False
