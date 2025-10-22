@@ -920,7 +920,7 @@ class CameraTestGUI(QMainWindow):
                 ("Feature Access Test", setup_runner("Feature Access", "Verify camera features are readable/writable and report unsupported nodes.", self.presenter.run_feature_tests), "Test camera feature access"),
                 ("Image Acquisition Test", setup_runner("Image Acquisition", "Continuously acquire frames to validate capture stability and stats.", self.presenter.run_image_acquisition_test), "Test image capture"),
                 ("Camera Initialization Test", setup_runner("Camera Initialization", "Sanity-check camera open/grab readiness with a quick test frame.", self.presenter.run_init_cam_test), "Test camera initialization"),
-                ("Image Quality Test", setup_runner("Image Quality", "Capture metrics such as sharpness/contrast/SNR depending on implementation.", self.presenter.run_image_quality_tests), "Test image quality metrics")
+                ("Image Quality Test", setup_runner("ImageQuality", "Capture metrics such as sharpness/contrast/SNR depending on implementation.", self.presenter.run_image_quality_tests), "Test image quality metrics")
             ], self.style_dict['primary']),
             ("⚡ Performance Tests", "Camera performance and speed testing", [
                 ("Max FPS Test", setup_runner("Max FPS", "Measure maximum achievable frame rate under current settings.", self.presenter.run_max_fps_test), "Test maximum frame rate"),
@@ -2207,11 +2207,37 @@ class TestSetupDialog(QDialog):
         if frame is None:
             return
         try:
-            frm = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frm.shape
+            frm_bgr = frame
+            frm_rgb = cv2.cvtColor(frm_bgr, cv2.COLOR_BGR2RGB)
+            h, w, ch = frm_rgb.shape
             bytes_per_line = ch * w
-            qimg = QImage(frm.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            qimg = QImage(frm_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
             pix = QPixmap.fromImage(qimg).scaled(self.live_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            # Overlay quick stats: mean DN, %sat, GV0/GVmax counts
+            try:
+                gray = cv2.cvtColor(frm_bgr, cv2.COLOR_BGR2GRAY)
+                mean_dn = float(np.mean(gray))
+                # Infer saturation DN from dtype
+                max_dn = 255.0 if gray.dtype == np.uint8 else 65535.0
+                sat_pct = float(100.0 * (gray.max() / max_dn)) if max_dn > 0 else 0.0
+                gv0 = int((gray == 0).sum())
+                gvmax = int((gray == int(max_dn)).sum())
+
+                painter = QPainter(pix)
+                painter.setRenderHint(QPainter.Antialiasing)
+                # Draw semi-transparent box
+                from PyQt5.QtGui import QColor
+                bg = QColor(0, 0, 0, 140)
+                painter.fillRect(10, 10, 260, 70, bg)
+                # Draw text
+                painter.setPen(Qt.white)
+                painter.drawText(20, 30, f"Mean DN: {mean_dn:.1f}")
+                painter.drawText(20, 50, f"%Sat: {sat_pct:.2f}%   GV0: {gv0}   GVmax: {gvmax}")
+                painter.end()
+            except Exception:
+                pass
+
             self.live_label.setPixmap(pix)
         except Exception:
             pass
@@ -2269,23 +2295,50 @@ class TestSetupDialog(QDialog):
         self._log_handler.setLevel(_logging.DEBUG)
         _logging.getLogger().addHandler(self._log_handler)
 
-        # Launch worker thread to run the provided callable
-        self._thread = QThread()
-        self._worker = _TestWorker(self.runner_callable)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        # For ImageQuality, use an async continuation runner to keep prompts non-blocking
+        if self.test_name == "ImageQuality" and hasattr(self.parent.presenter, 'run_image_quality_tests_async'):
+            def _done_cb(ok: bool):
+                try:
+                    # Ensure UI-thread invocation
+                    QTimer.singleShot(0, lambda: self._on_finished(bool(ok), "" if ok else "Test reported failure"))
+                except Exception:
+                    pass
+            try:
+                self.parent.presenter.view = self.parent.get_threadsafe_view_proxy()
+                self.parent.presenter.view.attach_run_log(self._runlog_bridge)
+            except Exception:
+                pass
+            try:
+                self.parent.presenter.run_image_quality_tests_async(_done_cb)
+            except Exception as e:
+                self._append_run_log(f"Failed to start ImageQuality async: {e}", "ERROR")
+                QTimer.singleShot(0, lambda: self._on_finished(False, str(e)))
+            # Keep the progress dialog modal while the async runner proceeds; it will close via _on_finished
+            self._progress.exec_()
+        else:
+            # Launch worker thread to run the provided callable
+            self._thread = QThread()
+            self._worker = _TestWorker(self.runner_callable)
+            self._worker.moveToThread(self._thread)
+            self._thread.started.connect(self._worker.run)
+            self._worker.finished.connect(self._on_finished)
+            self._worker.finished.connect(self._thread.quit)
+            self._worker.finished.connect(self._worker.deleteLater)
+            self._thread.finished.connect(self._thread.deleteLater)
+            self._thread.start()
 
-        self._progress.exec_()
+            self._progress.exec_()
 
     def _on_cancel(self):
         try:
             if hasattr(self, '_worker'):
                 self._worker.cancel()
+            # Also signal presenter to cooperatively cancel long-running stages
+            try:
+                if hasattr(self.parent.presenter, '_cancel_requested'):
+                    self.parent.presenter._cancel_requested = True
+            except Exception:
+                pass
             # Best-effort: stop live grabbing if running to release camera for tests
             # but keep right panel live for other flows as required
         except Exception:
@@ -2342,12 +2395,9 @@ class TestSetupDialog(QDialog):
         except Exception:
             pass
 
-        # Optionally restore live view for further adjustments
-        try:
-            self.parent.presenter.start_live_view()
-            self._live_timer.start(33)
-        except Exception:
-            pass
+        # Optionally restore live view for further adjustments (only if dialog remains open)
+        # This dialog will now close on finish to allow the standard results dialog to appear.
+        # If needed in future, this can be made configurable per test.
 
         # Turn off live indicator
         try:
@@ -2362,8 +2412,11 @@ class TestSetupDialog(QDialog):
             # If cancelled, error_message may be "Cancelled by user"
             self.parent.log_message(f"Finished with status: {error_message or 'Failed'}", "ERROR" if error_message and 'cancel' not in error_message.lower() else "WARNING")
 
-        # Note: Detailed results are shown by presenter via update_test_results.
-        # Keep setup dialog open to allow user to adjust further or close.
+        # Note: Detailed results are shown by presenter via update_test_results (modal dialog).
+        # Close this setup dialog now so the standard results dialog (with Save/Save As/Back/OK)
+        # and the post-test image-save prompt are visible and interactive.
+        # Revert to original behavior: do not auto-close the setup dialog here.
+        # The standard results dialog and the optional image-save prompt are handled by the presenter.
 
     # ---------- Run Log console helpers ----------
     def _on_bridge_log(self, message: str, level: str):

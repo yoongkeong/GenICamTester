@@ -33,6 +33,8 @@ class CameraPresenter:
         # Store last explicitly captured frame for GUI preview/save
         self.last_captured_frame = None
         self._init_logging()
+        # Cooperative cancellation flag for long-running presenter-driven tests
+        self._cancel_requested = False
 
     def _init_logging(self):
         """Initialize logging for the presenter"""
@@ -833,46 +835,1558 @@ class CameraPresenter:
             return False
 
     def run_image_quality_tests(self):
-        """Run image quality tests"""
+        """Run Image Quality test with operator-guided stages and consolidated report.
+
+        - Keeps right-panel Live View (handled by dialog); uses logs for guidance.
+        - Computes EMVA-aligned basic metrics (best-effort) and extended analyses.
+        - Writes a single test_result.txt in result/image_quality/<RunID>/.
+        - After compute, prompts user (GUI thread) to optionally save images/plots to a folder.
+        - No JSON or multiple artifact files are created automatically.
+        """
+        import os, time, math, platform, threading
+        import numpy as np
+        import cv2
+        from configparser import ConfigParser
+
+        TEST_NAME = "ImageQuality"
+
+        def log(level: str, msg: str):
+            try:
+                self.view.log_message(msg, level)
+            except Exception:
+                pass
+            lvl = (level or "INFO").upper()
+            if lvl == "ERROR":
+                self.logger.error(msg)
+            elif lvl in ("WARN", "WARNING"):
+                self.logger.warning(msg)
+            elif lvl == "SUCCESS":
+                self.logger.info(msg)
+            else:
+                self.logger.info(msg)
+
+        def stage(pct: int, text: str):
+            log('INFO', f"[{pct}%] {text}")
+
+        def check_cancel() -> bool:
+            return bool(getattr(self, '_cancel_requested', False))
+
+        def show_blocking_prompt(title: str, body: str) -> bool:
+            """Scene prompt helper supporting both UI-thread sync and worker-thread async flows.
+            - UI thread: build dialog and exec_ synchronously (modal loop).
+            - Worker thread: schedule non-blocking open() with finished callback and wait via Event.
+            Acquisition is paused before showing; resumes only if it was running and decision=Continue.
+            Single-instance guard, watchdog, global-cancel, parenting, centering, focus, and diagnostics preserved.
+            """
+            from PyQt5.QtWidgets import QMessageBox, QWidget, QApplication
+            from PyQt5.QtCore import Qt, QThread
+
+            # Determine current thread context and log mode
+            app = QApplication.instance()
+            on_ui_thread = bool(app) and (QThread.currentThread() == app.thread())
+            log('INFO', f"prompt_mode={'UI-sync' if on_ui_thread else 'worker-async'} title={title}")
+
+            # Lazy-init guard fields on presenter
+            if not hasattr(self, '_prompt_in_progress'):
+                self._prompt_in_progress = False
+            if not hasattr(self, '_current_prompt_event'):
+                self._current_prompt_event = None
+            if not hasattr(self, '_current_prompt_result'):
+                self._current_prompt_result = False
+            if not hasattr(self, '_scene_gate_active'):
+                self._scene_gate_active = False
+
+            # If a prompt is already open, ignore re-entry but wait for it to finish
+            if self._prompt_in_progress and self._current_prompt_event is not None:
+                log('INFO', 'ImageQuality: Prompt already open; ignoring duplicate request')
+                self._current_prompt_event.wait()
+                return bool(self._current_prompt_result)
+
+            # Pause acquisition safely and flush pending buffers
+            was_grabbing = False
+            try:
+                if self.camera_helper and self.camera_helper.camera and self.camera_helper.camera.IsGrabbing():
+                    log('INFO', 'ImageQuality: Pausing acquisition for scene prompt')
+                    self.camera_helper.camera.StopGrabbing()
+                    was_grabbing = True
+                    # Best-effort flush pending results
+                    try:
+                        while True:
+                            try:
+                                gr = self.camera_helper.camera.RetrieveResult(0)
+                                if gr and hasattr(gr, 'GrabSucceeded') and gr.GrabSucceeded():
+                                    try:
+                                        gr.Release()
+                                    except Exception:
+                                        pass
+                                else:
+                                    break
+                            except Exception:
+                                break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Gate further acquisition restarts until prompt closes
+            self._scene_gate_active = True
+
+            # Helper: resolve best parent dialog
+            def _resolve_parent():
+                try:
+                    parent = None
+                    try:
+                        active_modal = QApplication.activeModalWidget()
+                        if active_modal and hasattr(active_modal, 'windowTitle'):
+                            wt = str(active_modal.windowTitle())
+                            if wt == TEST_NAME or (TEST_NAME in wt):
+                                parent = active_modal
+                    except Exception:
+                        parent = None
+                    if parent is None:
+                        try:
+                            for w in QApplication.topLevelWidgets():
+                                try:
+                                    if hasattr(w, 'windowTitle') and hasattr(w, 'isVisible') and w.isVisible():
+                                        wt = str(w.windowTitle())
+                                        if wt == TEST_NAME or (TEST_NAME in wt):
+                                            parent = w
+                                            break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                    if parent is None:
+                        try:
+                            return self.view if isinstance(self.view, QWidget) else QApplication.activeWindow()
+                        except Exception:
+                            return None
+                    return parent
+                except Exception:
+                    return None
+
+            # Helper: build and configure the dialog
+            def _build_box(parent):
+                box = QMessageBox(parent)
+                box.setWindowTitle(title)
+                box.setText(body)
+                box.setIcon(QMessageBox.Information)
+                try:
+                    box.setModal(True)
+                    box.setWindowModality(Qt.ApplicationModal)
+                    box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+                except Exception:
+                    pass
+                box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+                try:
+                    box.button(QMessageBox.Yes).setText('Continue')
+                    box.button(QMessageBox.Cancel).setText('Cancel')
+                    yes_btn = box.button(QMessageBox.Yes)
+                    try:
+                        yes_btn.setDefault(True); yes_btn.setAutoDefault(True); yes_btn.setFocus(Qt.OtherFocusReason)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return box
+
+            # Helper: diagnostics
+            def _diag_before(parent):
+                try:
+                    p_title = parent.windowTitle() if (parent is not None and hasattr(parent, 'windowTitle')) else 'N/A'
+                    p_cls = parent.__class__.__name__ if parent is not None else 'None'
+                    try:
+                        g = parent.geometry() if parent is not None else None
+                        gtxt = f"x={g.x()} y={g.y()} w={g.width()} h={g.height()}" if g is not None else 'N/A'
+                    except Exception:
+                        gtxt = 'N/A'
+                    log('INFO', f"diag: prompt={'Dark' if 'Dark' in title else 'Light'} parent=<{p_cls},{p_title}> geom=({gtxt}) visible=0 active=0 on_ui_thread={1 if on_ui_thread else 0}")
+                except Exception:
+                    pass
+
+            def _position_and_raise(box, parent):
+                try:
+                    box.adjustSize()
+                    if parent is not None:
+                        try:
+                            pg = parent.frameGeometry(); sz = box.sizeHint()
+                            x = int(pg.center().x() - sz.width() / 2); y = int(pg.center().y() - sz.height() / 2)
+                            box.move(x, y)
+                        except Exception:
+                            pass
+                    try:
+                        box.raise_(); box.activateWindow()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # UI-thread synchronous path
+            if on_ui_thread:
+                parent = _resolve_parent()
+                box = _build_box(parent)
+                _diag_before(parent)
+                # watchdog and cancel polling
+                watchdog = QTimer(box); watchdog.setSingleShot(True); watchdog.setInterval(120000)
+                def _on_watchdog():
+                    try: log('WARNING', 'ImageQuality: Scene prompt timed out (no response in 120s)')
+                    except Exception: pass
+                    try: box.reject()
+                    except Exception: pass
+                try:
+                    watchdog.timeout.connect(_on_watchdog); watchdog.start()
+                except Exception:
+                    pass
+                cancel_timer = QTimer(box); cancel_timer.setSingleShot(False); cancel_timer.setInterval(400)
+                def _poll_cancel():
+                    try:
+                        if bool(getattr(self, '_cancel_requested', False)):
+                            try: log('INFO', 'ImageQuality: Global cancel while prompt — stopping test')
+                            except Exception: pass
+                            try: box.reject()
+                            except Exception: pass
+                    except Exception:
+                        pass
+                try:
+                    cancel_timer.timeout.connect(_poll_cancel); cancel_timer.start()
+                except Exception:
+                    pass
+                # Disable parent and keep strong ref
+                try:
+                    if parent is not None: parent.setEnabled(False)
+                except Exception:
+                    pass
+                try:
+                    self._current_prompt_widget = box
+                except Exception:
+                    pass
+                _position_and_raise(box, parent)
+                ret = box.exec_()
+                # Post diagnostics
+                try:
+                    vis = 1 if box.isVisible() else 0
+                    act = 1 if (box.isActiveWindow() if hasattr(box, 'isActiveWindow') else False) else 0
+                    log('INFO', f"diag: prompt={'Dark' if 'Dark' in title else 'Light'} parent=<inline> geom=(x={box.x()} y={box.y()} w={box.width()} h={box.height()}) visible={vis} active={act} on_ui_thread=1")
+                except Exception:
+                    pass
+                # Cleanup and decision
+                try: watchdog.stop()
+                except Exception: pass
+                try: cancel_timer.stop()
+                except Exception: pass
+                self._current_prompt_result = (ret == QMessageBox.Yes)
+                try:
+                    if parent is not None: parent.setEnabled(True)
+                except Exception:
+                    pass
+                if self._current_prompt_result:
+                    if was_grabbing:
+                        try:
+                            log('INFO', 'ImageQuality: Resuming acquisition after scene prompt (decision=Continue)')
+                            self.camera_helper.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                        except Exception:
+                            pass
+                else:
+                    try: log('INFO', 'ImageQuality: Acquisition remains stopped (decision=Cancel)')
+                    except Exception: pass
+                self._scene_gate_active = False
+                self._prompt_in_progress = False
+                try: self._current_prompt_widget = None
+                except Exception: pass
+                return bool(self._current_prompt_result)
+
+            # Worker-thread asynchronous path
+            done = threading.Event()
+            self._current_prompt_event = done
+            self._prompt_in_progress = True
+            self._current_prompt_result = False
+
+            def _ask():
+                parent = _resolve_parent()
+                box = _build_box(parent)
+                _diag_before(parent)
+                # Watchdog and cancel timers
+                watchdog = QTimer(box); watchdog.setSingleShot(True); watchdog.setInterval(120000)
+                def _on_watchdog():
+                    try: log('WARNING', 'ImageQuality: Scene prompt timed out (no response in 120s)')
+                    except Exception: pass
+                    try: box.reject()
+                    except Exception: pass
+                watchdog.timeout.connect(_on_watchdog); watchdog.start()
+
+                cancel_timer = QTimer(box); cancel_timer.setSingleShot(False); cancel_timer.setInterval(400)
+                def _poll_cancel():
+                    try:
+                        if bool(getattr(self, '_cancel_requested', False)):
+                            try: log('INFO', 'ImageQuality: Global cancel while prompt — stopping test')
+                            except Exception: pass
+                            try: box.reject()
+                            except Exception: pass
+                    except Exception:
+                        pass
+                cancel_timer.timeout.connect(_poll_cancel); cancel_timer.start()
+
+                def _on_finished(code: int):
+                    try:
+                        try: watchdog.stop()
+                        except Exception: pass
+                        try: cancel_timer.stop()
+                        except Exception: pass
+                        self._current_prompt_result = (code == QMessageBox.Yes)
+                        try:
+                            if parent is not None: parent.setEnabled(True)
+                        except Exception:
+                            pass
+                        if self._current_prompt_result:
+                            if was_grabbing:
+                                try:
+                                    log('INFO', 'ImageQuality: Resuming acquisition after scene prompt (decision=Continue)')
+                                    self.camera_helper.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                                except Exception:
+                                    pass
+                        else:
+                            try: log('INFO', 'ImageQuality: Acquisition remains stopped (decision=Cancel)')
+                            except Exception: pass
+                    finally:
+                        self._scene_gate_active = False
+                        self._prompt_in_progress = False
+                        try: self._current_prompt_widget = None
+                        except Exception: pass
+                        done.set()
+
+                try:
+                    box.finished.connect(_on_finished)
+                except Exception:
+                    pass
+
+                # Disable parent input while prompt is open
+                try:
+                    if parent is not None: parent.setEnabled(False)
+                except Exception:
+                    pass
+                # Keep strong ref
+                try:
+                    self._current_prompt_widget = box
+                except Exception:
+                    pass
+
+                # Show non-blocking and ensure visibility
+                def _post_show_diag_and_recover():
+                    try:
+                        vis = 1 if box.isVisible() else 0
+                        act = 1 if (box.isActiveWindow() if hasattr(box, 'isActiveWindow') else False) else 0
+                        try:
+                            pt = parent.windowTitle() if (parent is not None and hasattr(parent, 'windowTitle')) else 'N/A'
+                            pc = parent.__class__.__name__ if parent is not None else 'None'
+                        except Exception:
+                            pt, pc = 'N/A', 'None'
+                        log('INFO', f"diag: prompt={'Dark' if 'Dark' in title else 'Light'} parent=<{pc},{pt}> geom=(x={box.x()} y={box.y()} w={box.width()} h={box.height()}) visible={vis} active={act} on_ui_thread=0")
+                        if not vis:
+                            try: box.raise_(); box.activateWindow()
+                            except Exception: pass
+                            QTimer.singleShot(150, _fallback_reparent_if_hidden)
+                    except Exception:
+                        pass
+
+                def _fallback_reparent_if_hidden():
+                    try:
+                        if not box.isVisible():
+                            log('WARNING', 'Prompt visibility issue: reparent fallback without parent')
+                            try: box.hide()
+                            except Exception: pass
+                            try:
+                                box.setParent(None)
+                                box.setWindowModality(Qt.ApplicationModal)
+                                box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+                            except Exception:
+                                pass
+                            try:
+                                box.open(); QTimer.singleShot(0, lambda: _position_and_raise(box, parent))
+                            except Exception:
+                                try:
+                                    ret = box.exec_(); _on_finished(ret)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                try:
+                    box.open()
+                    QTimer.singleShot(0, lambda: _position_and_raise(box, parent))
+                    QTimer.singleShot(200, _post_show_diag_and_recover)
+                except Exception:
+                    # Fallback to exec_ on UI thread only
+                    ret = box.exec_()
+                    _on_finished(ret)
+
+            # Execute creation on UI thread
+            try:
+                QTimer.singleShot(0, _ask)
+            except Exception:
+                _ask()
+
+            # Worker waits for decision
+            done.wait()
+            return bool(self._current_prompt_result)
+
         try:
-            from tests.test_imgQuality import TestImageQuality
-
-            self.logger.info("Starting image quality tests")
-
+            # reset cancel flag at start
+            self._cancel_requested = False
             if not self.camera_helper or not self.camera_helper.camera:
                 raise RuntimeError("Camera not connected")
 
-            test = TestImageQuality()
-            test.setup(self.camera_helper)
+            cam = self.camera_helper.camera
+            gh = self.genicam_helper
+            try:
+                if getattr(gh, 'camera', None) is None:
+                    gh.set_camera(cam)
+            except Exception:
+                pass
 
-            results = test.test_image_quality()
-            if not results.get("success"):
-                raise RuntimeError(results.get("error", "Image quality test failed"))
+            # Load configuration
+            cfg = ConfigParser()
+            try:
+                cfg.read(os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'config', 'config.ini'))
+            except Exception:
+                pass
 
-            # Format results for display
-            lines = ["Image Quality Metrics:"]
-            metrics = results.get("results", {})
-            for k, v in metrics.items():
-                val = v.get("value")
-                passed = v.get("pass")
-                thresh = v.get("threshold")
-                if thresh is not None:
-                    lines.append(f"- {k}: {val:.4g} (pass={passed}, threshold={thresh})")
-                else:
+            def cfg_get(sec: str, key: str, default, cast=str):
+                try:
+                    if not cfg.has_section('image_quality'):
+                        # try upper-case section name variant
+                        if cfg.has_section('IMAGE_QUALITY'):
+                            sec = 'IMAGE_QUALITY'
+                        else:
+                            return default
+                    else:
+                        sec = 'image_quality'
+                    if not cfg.has_option(sec, key):
+                        return default
+                    val = cfg.get(sec, key)
+                    return cast(val)
+                except Exception:
+                    return default
+
+            warmup_minutes = cfg_get('image_quality', 'warmup_minutes', 0, int)
+            N_dark = cfg_get('image_quality', 'dark.N_frames', 32, int)
+            N_flat = cfg_get('image_quality', 'flat.N_frames', 32, int)
+            sweep_steps = cfg_get('image_quality', 'sweep.steps', 12, int)
+            sweep_k = cfg_get('image_quality', 'sweep.frames_per_step', 8, int)
+            target_mean_pct = cfg_get('image_quality', 'target_mean_pct', 60.0, float)
+            max_sat_pct = cfg_get('image_quality', 'max_saturation_pct', 98.5, float)
+            flicker_secs = cfg_get('image_quality', 'flicker.capture_seconds', 3, int)
+            flicker_pass_pct = cfg_get('image_quality', 'flicker.pass_peak_pct', 5.0, float)
+            flicker_fail_pct = cfg_get('image_quality', 'flicker.fail_peak_pct', 15.0, float)
+            hot_sigma_k = cfg_get('image_quality', 'hotpixel.sigma_k', 6.0, float)
+            hot_warn = cfg_get('image_quality', 'hotpixel.max_count_warn', 50, int)
+            hot_fail = cfg_get('image_quality', 'hotpixel.max_count_fail', 200, int)
+            N_straylight = cfg_get('image_quality', 'straylight.N_frames', 16, int)
+            stray_req_note = cfg_get('image_quality', 'straylight.operator_note_required', False, lambda v: str(v).lower() in ('1','true','yes'))
+            color_enabled = cfg_get('image_quality', 'color.enabled', False, lambda v: str(v).lower() in ('1','true','yes'))
+            gamma_required = cfg_get('image_quality', 'gamma_required', True, lambda v: str(v).lower() in ('1','true','yes'))
+            save_images_prompt = cfg_get('image_quality', 'save_images_prompt', True, lambda v: str(v).lower() in ('1','true','yes'))
+
+            # Instrumentation helpers for logging
+            last_first_latency_ms = {}
+            def read_exposure_us():
+                try:
+                    if gh and gh.has_node('ExposureTime'):
+                        return float(gh.get_node_value('ExposureTime'))
+                    if gh and gh.has_node('ExposureTimeAbs'):
+                        return float(gh.get_node_value('ExposureTimeAbs'))
+                except Exception:
+                    pass
+                return None
+
+            def emit_scene_stats(scene_name: str, frames_arr: np.ndarray, first_latency_ms: float = None):
+                try:
+                    if frames_arr is None:
+                        return
+                    n = int(frames_arr.shape[0]) if hasattr(frames_arr, 'shape') else (len(frames_arr) if isinstance(frames_arr, list) else 1)
+                    # Use first frame to compute quick stats
+                    fr0 = frames_arr[0] if n >= 1 else None
+                    if fr0 is None:
+                        return
+                    gray0 = fr0 if (fr0.ndim == 2 or (fr0.ndim == 3 and fr0.shape[2] == 1)) else cv2.cvtColor(fr0, cv2.COLOR_BGR2GRAY)
+                    mean_dn = float(np.mean(gray0))
+                    max_dn = 65535.0 if gray0.dtype == np.uint16 else 255.0
+                    sat_pct = float(100.0 * (float(np.max(gray0)) / max_dn)) if max_dn > 0 else 0.0
+                    gv0 = int((gray0 == 0).sum())
+                    gv255 = int((gray0 == int(max_dn)).sum())
+                    ff_ms = first_latency_ms if first_latency_ms is not None else (last_first_latency_ms.get(scene_name) if scene_name in last_first_latency_ms else None)
+                    ff_txt = f"{ff_ms:.1f}" if isinstance(ff_ms, (int, float)) else "N/A"
+                    log('INFO', f"Scene stats: scene={scene_name} frames={n} first_frame_latency_ms={ff_txt} mean_dn={mean_dn:.4g} sat_pct={sat_pct:.2f}% gv0_count={gv0} gv255_count={gv255}")
+                except Exception:
+                    pass
+
+            # Run ID and default output file
+            run_id = time.strftime('%Y%m%d_%H%M%S')
+            out_dir = os.path.abspath(os.path.join(os.getcwd(), 'result', 'image_quality', run_id))
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception:
+                pass
+            report_path = os.path.join(out_dir, 'test_result.txt')
+
+            # Environment snapshot
+            try:
+                from pypylon import pylon as _pylon
+                sdk_ver = getattr(_pylon, 'PylonVersion', None) or getattr(_pylon, 'GetPylonVersionString', lambda: 'unknown')()
+            except Exception:
+                sdk_ver = 'unknown'
+            try:
+                model = cam.DeviceModelName.GetValue() if hasattr(cam, 'DeviceModelName') else 'Unknown'
+            except Exception:
+                model = 'Unknown'
+            try:
+                serial = cam.DeviceSerialNumber.GetValue() if hasattr(cam, 'DeviceSerialNumber') else 'Unknown'
+            except Exception:
+                serial = 'Unknown'
+
+            # Helper conversions
+            def to_gray(img):
+                if img is None:
+                    return None
+                if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
+                    return img
+                return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            def get_saturation_dn(img=None):
+                if img is not None:
+                    g = to_gray(img)
+                    if g is None:
+                        return 255.0
+                    if g.dtype == np.uint8:
+                        return 255.0
+                    if g.dtype == np.uint16:
+                        return 65535.0
+                    return float(np.max(g))
+                return 255.0
+
+            def capture_frame(timeout_ms=1200):
+                """Best-effort single frame capture with multiple fallbacks.
+                Order: GrabOne -> (temporary StartGrabbing + RetrieveResult) -> software trigger -> helper.get_frame
+                """
+                # 1) Direct GrabOne
+                try:
+                    grab = cam.GrabOne(int(timeout_ms))
+                    if grab and grab.GrabSucceeded():
+                        arr = grab.Array
+                        try:
+                            grab.Release()
+                        except Exception:
+                            pass
+                        return arr
+                except Exception:
+                    pass
+
+                # 2) Temporary StartGrabbing + RetrieveResult
+                started_here = False
+                try:
+                    if not cam.IsGrabbing():
+                        try:
+                            cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                            started_here = True
+                        except Exception:
+                            started_here = False
+                    if cam.IsGrabbing():
+                        try:
+                            grab2 = cam.RetrieveResult(int(timeout_ms))
+                            if grab2 and grab2.GrabSucceeded():
+                                arr2 = grab2.Array
+                                try:
+                                    grab2.Release()
+                                except Exception:
+                                    pass
+                                return arr2
+                        except Exception:
+                            pass
+                finally:
                     try:
-                        lines.append(f"- {k}: {val:.4g} (pass={passed})")
+                        if started_here and cam.IsGrabbing():
+                            cam.StopGrabbing()
                     except Exception:
-                        lines.append(f"- {k}: {val} (pass={passed})")
+                        pass
 
-            summary = "\n".join(lines)
-            self.view.update_test_results("Image Quality", summary)
+                # 3) Software trigger attempt via GenICam if trigger is enabled
+                try:
+                    if gh is not None:
+                        try:
+                            if getattr(gh, 'camera', None) is None:
+                                gh.set_camera(cam)
+                        except Exception:
+                            pass
+                        if gh.has_node('TriggerMode'):
+                            try:
+                                mode = gh.get_node_value('TriggerMode')
+                            except Exception:
+                                mode = None
+                            if str(mode).lower() in ('on', 'true', '1'):
+                                try:
+                                    if gh.has_node('TriggerSource'):
+                                        gh.set_node_value('TriggerSource', 'Software')
+                                except Exception:
+                                    pass
+                                # Execute software trigger node if present
+                                try:
+                                    trig_node = gh._get_node('TriggerSoftware') if hasattr(gh, '_get_node') else None
+                                    if trig_node is not None:
+                                        for cmd in ('Execute', 'ExecuteCommand', 'Run'):
+                                            try:
+                                                if hasattr(trig_node, cmd):
+                                                    getattr(trig_node, cmd)()
+                                                    break
+                                            except Exception:
+                                                continue
+                                except Exception:
+                                    pass
+                                # Try to pull the frame
+                                try:
+                                    grab3 = cam.RetrieveResult(int(timeout_ms))
+                                    if grab3 and grab3.GrabSucceeded():
+                                        arr3 = grab3.Array
+                                        try:
+                                            grab3.Release()
+                                        except Exception:
+                                            pass
+                                        return arr3
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+                # 4) Helper fallback
+                try:
+                    return self.camera_helper.get_frame(cam)
+                except Exception:
+                    return None
+
+            def capture_stack(n, settle=2, delay=0.0, scene_name=None):
+                """Capture a stack of frames with higher robustness.
+                If not already grabbing, start a temporary grabbing session and use RetrieveResult.
+                """
+                frames = []
+                started_here = False
+                first_frame_time = None
+                try:
+                    # Ensure continuous acquisition
+                    try:
+                        if gh and gh.has_node('TriggerMode'):
+                            gh.set_node_value('TriggerMode', 'Off')
+                        if gh and gh.has_node('AcquisitionMode'):
+                            gh.set_node_value('AcquisitionMode', 'Continuous')
+                    except Exception:
+                        pass
+
+                    # Start grab if needed
+                    if not cam.IsGrabbing():
+                        try:
+                            cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                            started_here = True
+                        except Exception:
+                            started_here = False
+
+                    # Settle frames (discard)
+                    for _ in range(max(0, settle)):
+                        if check_cancel():
+                            break
+                        if hasattr(cam, 'RetrieveResult') and cam.IsGrabbing():
+                            try:
+                                g0 = cam.RetrieveResult(2000)
+                                if g0 and g0.GrabSucceeded():
+                                    try:
+                                        g0.Release()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                # On error, attempt single-frame fallback
+                                _ = capture_frame()
+                        else:
+                            _ = capture_frame()
+
+                    # Acquire frames
+                    for _ in range(n):
+                        if check_cancel():
+                            break
+                        f = None
+                        if hasattr(cam, 'RetrieveResult') and cam.IsGrabbing():
+                            # Try a few times per frame
+                            restart_done = False
+                            for _attempt in range(6):
+                                try:
+                                    t0 = time.time()
+                                    gr = cam.RetrieveResult(3500)
+                                    if gr and gr.GrabSucceeded():
+                                        f = gr.Array
+                                        try:
+                                            gr.Release()
+                                        except Exception:
+                                            pass
+                                        if first_frame_time is None:
+                                            first_frame_time = (time.time() - t0) * 1000.0
+                                        break
+                                except Exception:
+                                    # Log timeout with scene and exposure context
+                                    try:
+                                        expus = read_exposure_us()
+                                        if scene_name:
+                                            log('WARNING', f"Grab timed out (scene={scene_name} exposure_us={expus if expus is not None else 'N/A'})")
+                                    except Exception:
+                                        pass
+                                    time.sleep(0.08)
+                                    # On persistent failures, attempt one restart of grabbing
+                                    if _attempt == 3 and not restart_done:
+                                        try:
+                                            if cam.IsGrabbing():
+                                                cam.StopGrabbing()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                                            restart_done = True
+                                        except Exception:
+                                            pass
+                        else:
+                            # Fallback to generic capture
+                            for _attempt in range(5):
+                                f = capture_frame()
+                                if f is not None:
+                                    if first_frame_time is None:
+                                        first_frame_time = 0.0  # unknown via helper; treat as 0 for logging
+                                    break
+                                time.sleep(0.08)
+                        if f is not None:
+                            frames.append(f)
+                        if delay > 0:
+                            time.sleep(delay)
+                finally:
+                    # Stop grab if we started it
+                    if started_here:
+                        try:
+                            if cam.IsGrabbing():
+                                cam.StopGrabbing()
+                        except Exception:
+                            pass
+
+                if len(frames) == 0:
+                    raise RuntimeError('Failed to capture frames')
+                # record first-frame latency for scene
+                try:
+                    if scene_name is not None and first_frame_time is not None:
+                        last_first_latency_ms[scene_name] = float(first_frame_time)
+                except Exception:
+                    pass
+                return np.stack(frames, axis=0)
+
+            # Warm-up / Pre-conditioning
+            stage(10, "Warm-up / Pre-conditioning")
+            # Lock processing (best effort)
+            try:
+                if gh.has_node('GammaEnable'):
+                    gh.set_node_value('GammaEnable', False)
+                if gh.has_node('Gamma') and gamma_required:
+                    gh.set_node_value('Gamma', 1.0)
+            except Exception:
+                log('INFO', 'Feature skipped: Gamma/GammaEnable not available/writable')
+            for node, val in [('NoiseReduction', 0), ('SharpeningEnable', False), ('BalanceWhiteAuto', 'Off'),
+                              ('BlackLevel', None), ('TriggerMode', 'Off'), ('AcquisitionMode', 'Continuous')]:
+                try:
+                    if val is None:
+                        continue
+                    if gh.has_node(node):
+                        gh.set_node_value(node, val)
+                except Exception:
+                    log('INFO', f"Feature skipped: {node} not available/writable")
+
+            if warmup_minutes and warmup_minutes > 0:
+                total = warmup_minutes * 60
+                t0 = time.time()
+                log('INFO', f"Warming up for {warmup_minutes} min…")
+                while time.time() - t0 < total:
+                    if check_cancel():
+                        break
+                    remaining = int(total - (time.time() - t0))
+                    if remaining % 30 == 0:
+                        log('INFO', f"Warm-up remaining: {remaining}s")
+                    time.sleep(1)
+
+            # Settings snapshot after warm-up/locking
+            try:
+                def _get(n):
+                    try:
+                        return gh.get_node_value(n) if gh and gh.has_node(n) else 'N/A'
+                    except Exception:
+                        return 'N/A'
+                pixfmt = _get('PixelFormat')
+                # bit depth inference from PixelFormat
+                bd = 16 if (isinstance(pixfmt, str) and ('16' in pixfmt or '12' in pixfmt)) else (8 if isinstance(pixfmt, str) and '8' in str(pixfmt) else 'N/A')
+                exposure = read_exposure_us()
+                gain = _get('Gain')
+                gamma_v = _get('Gamma') if gamma_required else 'OFF'
+                black = _get('BlackLevel')
+                trig = _get('TriggerMode')
+                acq = _get('AcquisitionMode')
+                try:
+                    w = _get('Width'); h = _get('Height')
+                    roi_txt = f"(0,0,{w},{h})" if w!='N/A' and h!='N/A' else 'N/A'
+                except Exception:
+                    roi_txt = 'N/A'
+                fps = _get('AcquisitionFrameRate')
+                sensor_temp = _get('DeviceTemperature')
+                log('INFO', f"settings: pixelformat={pixfmt} bit_depth={bd} exposure_us={exposure if exposure is not None else 'N/A'} gain_db={gain} gamma={gamma_v} blacklevel_dn={black} trigger_mode={trig} acq_mode={acq} roi={roi_txt} fps={fps} sensor_temp_c={sensor_temp}")
+            except Exception:
+                pass
+
+            status = 'Canceled by user' if check_cancel() else 'Completed'
+
+            # If cancelled during warm-up, write partial report and exit
+            if check_cancel():
+                log('INFO', 'Cancel acknowledged — stopping acquisition and finalizing partial results')
+                report_lines = [
+                    "=== IMAGE QUALITY TEST RESULT =========================================",
+                    f"Run ID: {run_id}     Camera: {model} / {serial}    SDK: {sdk_ver}",
+                    f"Status: {status}",
+                    "",
+                    "[CONFIG]",
+                    f"dark.N_frames={N_dark}",
+                    f"flat.N_frames={N_flat}",
+                    f"sweep.steps={sweep_steps}  sweep.frames_per_step={sweep_k}",
+                    f"target_mean_pct={target_mean_pct}",
+                    f"max_saturation_pct={max_sat_pct}",
+                    f"gamma_required={'true' if gamma_required else 'false'}",
+                    f"save_raw_images_prompted={'true' if save_images_prompt else 'false'}",
+                    f"images_saved_to=not saved",
+                    "",
+                    "[PASS/FAIL SUMMARY]",
+                    "Overall: FAIL",
+                    "Reasons (for FAIL): Canceled by user",
+                ]
+                try:
+                    with open(report_path, 'w', encoding='utf-8') as f:
+                        f.write("\n".join(report_lines))
+                    log('SUCCESS', f"Wrote test_result.txt → {report_path}")
+                except Exception as e:
+                    log('ERROR', f"Failed to write report: {e}")
+                try:
+                    self.view.update_test_results('Image Quality', "\n".join(report_lines))
+                except Exception:
+                    pass
+                return False
+
+            # Acquire Dark Scene
+            stage(25, "Dark Scene: capture frames")
+            # Operator prompt (Dark)
+            log('INFO', 'ImageQuality: Dark scene prompt shown.')
+            dark_prompt_state = 'confirmed'
+            if not show_blocking_prompt(
+                title='Dark Scene Required',
+                body='Please close the lens cap/cover, ensure no stray light enters the sensor, then press Continue.'
+            ):
+                dark_prompt_state = 'canceled'
+                log('WARNING', 'ImageQuality: Dark scene canceled by user.')
+                # Write partial report and stop this test safely
+                status = 'Canceled by user'
+                report_lines = [
+                    "=== IMAGE QUALITY TEST RESULT =========================================",
+                    f"Run ID: {run_id}     Camera: {model} / {serial}    SDK: {sdk_ver}",
+                    f"Status: {status}",
+                    "",
+                    "[CONFIG]",
+                    f"dark.N_frames={N_dark}",
+                    f"flat.N_frames={N_flat}",
+                    f"sweep.steps={sweep_steps}  sweep.frames_per_step={sweep_k}",
+                    f"target_mean_pct={target_mean_pct}",
+                    f"max_saturation_pct={max_sat_pct}",
+                    f"gamma_required={'true' if gamma_required else 'false'}",
+                    f"save_raw_images_prompted={'true' if save_images_prompt else 'false'}",
+                    f"images_saved_to=not saved",
+                    f"dark_scene_prompt=canceled",
+                    f"scene_skipped_reason=user_canceled_prompt",
+                ]
+                try:
+                    with open(report_path, 'w', encoding='utf-8') as f:
+                        f.write("\n".join(report_lines))
+                    log('SUCCESS', f"Wrote test_result.txt → {report_path}")
+                except Exception as e:
+                    log('ERROR', f"Failed to write report: {e}")
+                try:
+                    self.view.update_test_results('Image Quality', "\n".join(report_lines))
+                except Exception:
+                    pass
+                return False
+            else:
+                log('INFO', 'ImageQuality: Dark scene confirmed.')
+            dark_stack = capture_stack(N_dark, settle=2, delay=0.0, scene_name='Dark')
+            dark_gray = np.stack([to_gray(f) for f in dark_stack], axis=0).astype(np.float32)
+            dark_mean = np.mean(dark_gray, axis=0)
+            dark_sigma = np.std(dark_gray, axis=0)
+            temporal_noise_dn = float(np.median(dark_sigma))
+            dsnu_dn = float(np.std(dark_mean))
+            # Zero saturation check
+            sat_dn = get_saturation_dn(dark_stack[0])
+            dark_sat_pct = float(100.0 * (dark_stack.max() / max(1.0, sat_dn)))
+            # Scene stats for Dark
+            emit_scene_stats('Dark', dark_stack, last_first_latency_ms.get('Dark'))
+            # Metric logs for Dark
+            log('INFO', f"TemporalNoise (EMVA): temporal_noise_dn={temporal_noise_dn:.4g} pass={np.isfinite(temporal_noise_dn)} threshold=N/A scene=Dark")
+            log('INFO', f"DSNU (EMVA): dsnu_dn={dsnu_dn:.4g} pass={np.isfinite(dsnu_dn)} threshold=N/A scene=Dark")
+
+            # Flat-Field Scene
+            stage(45, "Flat-Field: reach target mean and capture frames")
+            # Operator prompt (Light/Flat)
+            log('INFO', 'ImageQuality: Light scene prompt shown.')
+            light_prompt_state = 'confirmed'
+            proceed_light = show_blocking_prompt(
+                title='Light Scene Required',
+                body='Please expose the sensor to a uniform, focused light source (avoid saturation), then press Continue.'
+            )
+            if not proceed_light:
+                light_prompt_state = 'canceled'
+                log('WARNING', 'ImageQuality: Light scene canceled by user.')
+            else:
+                log('INFO', 'ImageQuality: Light scene confirmed.')
+            # Best-effort exposure tuning to reach ~target_mean_pct
+            target_dn = float(target_mean_pct / 100.0 * sat_dn)
+            # Initialize defaults in case light scene is canceled
+            signal = None
+            mean_signal = float('nan')
+            prnu = float('nan')
+            flat_sat_pct = float('nan')
+            if proceed_light:
+                try:
+                    # Read current exposure and adjust coarsely
+                    cur_exp = None
+                    if gh.has_node('ExposureTime'):
+                        cur_exp = float(gh.get_node_value('ExposureTime'))
+                    elif gh.has_node('ExposureTimeAbs'):
+                        cur_exp = float(gh.get_node_value('ExposureTimeAbs'))
+                    if cur_exp is None:
+                        cur_exp = 2000.0
+                    # simple hill-climb for up to 6 iterations
+                    exp = cur_exp
+                    for _ in range(6):
+                        if check_cancel():
+                            break
+                        try:
+                            if gh.has_node('ExposureTime'):
+                                gh.set_node_value('ExposureTime', exp)
+                            elif gh.has_node('ExposureTimeAbs'):
+                                gh.set_node_value('ExposureTimeAbs', exp)
+                        except Exception:
+                            pass
+                        time.sleep(0.05)
+                        f = capture_frame()
+                        if f is None:
+                            break
+                        m = float(np.mean(to_gray(f)))
+                        if m <= 1:
+                            exp *= 1.8
+                        elif m < target_dn * 0.95:
+                            exp *= 1.2
+                        elif m > target_dn * 1.05:
+                            exp *= 0.85
+                        else:
+                            break
+                except Exception:
+                    pass
+
+                flat_stack = capture_stack(N_flat, settle=2, delay=0.0, scene_name='Flat')
+                flat_gray = np.stack([to_gray(f) for f in flat_stack], axis=0).astype(np.float32)
+                flat_mean = np.mean(flat_gray, axis=0)
+                signal = np.clip(flat_mean - dark_mean, 0, None)
+                mean_signal = float(np.mean(signal))
+                prnu = float(np.std(signal) / (mean_signal + 1e-9)) if mean_signal > 0 else float('nan')
+                flat_sat_pct = float(100.0 * (flat_stack.max() / max(1.0, sat_dn)))
+                emit_scene_stats('Flat', flat_stack, last_first_latency_ms.get('Flat'))
+                # Metric logs for Flat
+                log('INFO', f"PRNU (EMVA): prnu_pct={(prnu*100.0 if np.isfinite(prnu) else float('nan')):.4g}% pass={np.isfinite(prnu)} threshold=N/A scene=Flat")
+                log('INFO', f"MeanSignal: mean_signal_dn={mean_signal:.4g} pass={np.isfinite(mean_signal)} threshold=N/A scene=Flat")
+
+            # Exposure Sweep (linearity / DR / PTC)
+            stage(65, "Exposure Sweep")
+            # Build log-spaced exposures around current value if available
+            try:
+                cur_exp = None
+                if gh.has_node('ExposureTime'):
+                    cur_exp = float(gh.get_node_value('ExposureTime'))
+                elif gh.has_node('ExposureTimeAbs'):
+                    cur_exp = float(gh.get_node_value('ExposureTimeAbs'))
+                if cur_exp is None or cur_exp <= 0:
+                    cur_exp = 2000.0
+            except Exception:
+                cur_exp = 2000.0
+            exp_min = max(50.0, cur_exp / 8.0)
+            exp_max = cur_exp * 8.0
+            exp_list = np.geomspace(exp_min, exp_max, max(3, sweep_steps)).astype(float).tolist()
+
+            sweep_means = []
+            sweep_vars = []
+            used_exps = []
+            early_stop = False
+            for e in exp_list:
+                if check_cancel():
+                    break
+                try:
+                    if gh.has_node('ExposureTime'):
+                        gh.set_node_value('ExposureTime', float(e))
+                    elif gh.has_node('ExposureTimeAbs'):
+                        gh.set_node_value('ExposureTimeAbs', float(e))
+                except Exception:
+                    pass
+                _ = capture_frame()
+                st = capture_stack(sweep_k, settle=0, delay=0.0, scene_name='Sweep')
+                g = np.stack([to_gray(f) for f in st], axis=0).astype(np.float32)
+                m = float(np.mean(g))
+                v = float(np.var(g))
+                sweep_means.append(m); sweep_vars.append(v); used_exps.append(float(e))
+                if (m / max(1.0, sat_dn)) * 100.0 > max_sat_pct:
+                    early_stop = True
+                    break
+
+            # Linearity fit
+            if len(used_exps) >= 3:
+                x = np.array(used_exps, dtype=np.float64)
+                y = np.array(sweep_means, dtype=np.float64)
+                A = np.vstack([x, np.ones_like(x)]).T
+                slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+                y_pred = slope * x + intercept
+                ss_res = float(np.sum((y - y_pred) ** 2))
+                ss_tot = float(np.sum((y - y.mean()) ** 2))
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            else:
+                slope = float('nan'); intercept = float('nan'); r2 = float('nan')
+            # Log scene stats for Sweep (aggregate)
+            try:
+                if len(sweep_means) > 0:
+                    # Use last captured stack mean as representative
+                    gv0 = gv255 = 0
+                    mean_dn_agg = float(np.mean(sweep_means))
+                    sat_pct_agg = float(100.0 * (max(sweep_means) / max(1.0, sat_dn)))
+                    log('INFO', f"Scene stats: scene=Sweep frames={int(len(sweep_means)*sweep_k)} first_frame_latency_ms=N/A mean_dn={mean_dn_agg:.4g} sat_pct={sat_pct_agg:.2f}% gv0_count={gv0} gv255_count={gv255}")
+            except Exception:
+                pass
+            # Metric logs for Sweep
+            log('INFO', f"Linearity: linearity_gain={slope:.4g} linearity_offset_dn={intercept:.4g} linearity_r2={r2:.4g} pass={(np.isfinite(r2) and r2>=0.95)} threshold_r2=0.95 scene=Sweep")
+
+            # Noise floor from dark
+            noise_floor = temporal_noise_dn
+            dr_ratio = max((sat_dn - intercept) / max(1e-6, noise_floor), 1e-6) if np.isfinite(intercept) else max(sat_dn / max(1e-6, noise_floor), 1e-6)
+            dr_db = float(20.0 * math.log10(dr_ratio)) if np.isfinite(dr_ratio) else float('nan')
+            dr_stops = float(math.log(dr_ratio, 2)) if np.isfinite(dr_ratio) else float('nan')
+            log('INFO', f"DynamicRange: dr_db={dr_db:.4g}dB dr_stops={dr_stops:.4g} pass={np.isfinite(dr_db)} threshold_db=N/A scene=Sweep")
+            log('INFO', f"NoiseFloor (EMVA): noise_floor_dn={noise_floor:.4g} pass={np.isfinite(noise_floor)} threshold=N/A scene=Dark")
+
+            # Slanted-Edge optional (fallback to MTF proxy)
+            stage(75, "Edge scene (optional) / MTF proxy")
+            t_edge0 = time.time(); edge_frame = capture_frame(); ff_edge_ms = (time.time()-t_edge0)*1000.0
+            try:
+                gray = to_gray(edge_frame).astype(np.float32)
+                gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+                mag = cv2.magnitude(gx, gy)
+                y0, x0 = np.unravel_index(np.argmax(mag), mag.shape)
+                y0 = int(np.clip(y0, 5, gray.shape[0] - 6))
+                band = gray[y0 - 5:y0 + 5, :]
+                edge_spread = float(band.std()) + 1e-9
+                mtf_proxy = float(1.0 / edge_spread)
+                # FFT rolloff
+                f = np.fft.fft2(gray)
+                fshift = np.fft.fftshift(f)
+                ps = np.abs(fshift) ** 2
+                h, w = ps.shape; cy, cx = h // 2, w // 2; r = min(cy, cx)
+                low = ps[cy - r // 4:cy + r // 4, cx - r // 4:cx + r // 4].mean()
+                high_ring = ps.mean() - low
+                fft_rolloff = float(low / (high_ring + 1e-9))
+            except Exception:
+                mtf_proxy = float('nan'); fft_rolloff = float('nan')
+            try:
+                emit_scene_stats('Edge', np.stack([edge_frame], axis=0) if edge_frame is not None else None, ff_edge_ms)
+            except Exception:
+                pass
+            log('INFO', f"MTF / Proxy: mtf_proxy={mtf_proxy:.4g} pass={np.isfinite(mtf_proxy)} scene=Edge")
+            log('INFO', f"FFT Rolloff: fft_rolloff_slope={fft_rolloff:.4g} pass={np.isfinite(fft_rolloff)} scene=Edge")
+
+            # Stray-Light Sensitivity
+            stage(85, "Stray-light sensitivity")
+            stray_stack = capture_stack(N_straylight, settle=1, delay=0.0, scene_name='StrayLight')
+            stray_gray = np.stack([to_gray(f) for f in stray_stack], axis=0).astype(np.float32)
+            stray_mean = float(np.mean(stray_gray))
+            dark_mean_scalar = float(np.mean(dark_gray))
+            stray_delta = float(stray_mean - dark_mean_scalar)
+            stray_increase_pct = float(100.0 * (stray_delta / max(1e-6, dark_mean_scalar))) if dark_mean_scalar > 0 else float('nan')
+            emit_scene_stats('StrayLight', stray_stack, last_first_latency_ms.get('StrayLight'))
+            log('INFO', f"StrayLight: straylight_delta_dn={stray_delta:.4g} increase_pct={stray_increase_pct:.2f}% pass={np.isfinite(stray_increase_pct)} scene=StrayLight")
+
+            # Flicker Detection
+            stage(88, "Flicker detection")
+            # Collect time series of mean DN
+            means_ts = []
+            t_end = time.time() + max(1, int(flicker_secs))
+            # Keep grabbing with a best-effort rate
+            while time.time() < t_end:
+                if check_cancel():
+                    break
+                fr = capture_frame()
+                if fr is None:
+                    try:
+                        expus = read_exposure_us()
+                        log('WARNING', f"Grab timed out (scene=Flicker exposure_us={expus if expus is not None else 'N/A'})")
+                    except Exception:
+                        pass
+                    continue
+                means_ts.append(float(np.mean(to_gray(fr))))
+            flicker_peaks = []
+            flicker_decision = 'N/A'
+            try:
+                import numpy.fft as _fft
+                y = np.array(means_ts, dtype=np.float64)
+                y = y - np.mean(y)
+                n = len(y)
+                if n >= 8:
+                    Y = np.abs(_fft.rfft(y))
+                    freqs = _fft.rfftfreq(n, d=1.0/30.0)  # assume ~30 FPS sampling nominally
+                    rel = (Y / (np.max(Y) + 1e-12)) * 100.0
+                    # find top peaks near 50/60 Hz and harmonics
+                    targets = [50, 60, 100, 120]
+                    for t in targets:
+                        idx = int(np.argmin(np.abs(freqs - t)))
+                        if idx < len(rel):
+                            flicker_peaks.append((float(freqs[idx]), float(rel[idx])))
+                    # decision
+                    max_pk = max((p[1] for p in flicker_peaks), default=0.0)
+                    if max_pk >= flicker_fail_pct:
+                        flicker_decision = 'FAIL'
+                    elif max_pk >= flicker_pass_pct:
+                        flicker_decision = 'WARN'
+                    else:
+                        flicker_decision = 'PASS'
+            except Exception:
+                pass
+            try:
+                # Scene stats for Flicker (approximate)
+                n = len(means_ts)
+                mean_dn_ts = float(np.mean(means_ts)) if n>0 else float('nan')
+                log('INFO', f"Scene stats: scene=Flicker frames={n} first_frame_latency_ms=N/A mean_dn={mean_dn_ts:.4g} sat_pct=N/A gv0_count=0 gv255_count=0")
+            except Exception:
+                pass
+            # Flicker metric log
+            try:
+                peaks_fmt = '[' + ', '.join([f"(freq={a:.2f},mag_pct={b:.2f})" for a,b in flicker_peaks]) + ']'
+                log('INFO', f"Flicker: flicker_peaks_hz={peaks_fmt} decision={flicker_decision} capture_s={float(flicker_secs):.1f} scene=Flicker")
+            except Exception:
+                pass
+
+            # Hot/Defect Pixel Map
+            hot_mask = (dark_mean + hot_sigma_k * dark_sigma)  # threshold image
+            hot_pix_coords = []
+            try:
+                thr = np.mean(dark_mean) + hot_sigma_k * np.median(dark_sigma)
+                mask = dark_mean > thr
+                ys, xs = np.where(mask)
+                vals = dark_mean[ys, xs]
+                hot_pix_coords = list(zip(xs.tolist(), ys.tolist(), vals.tolist()))
+            except Exception:
+                pass
+            hot_count = len(hot_pix_coords)
+            # Baseline compare
+            baseline_path = 'N/A'
+            baseline_delta = 0
+            added = []
+            removed = []
+            try:
+                # look for hotpixels_<serial>.txt anywhere under result/
+                cand = os.path.join(os.getcwd(), 'result', f'hotpixels_{serial}.txt')
+                if os.path.exists(cand):
+                    baseline_path = cand
+                    base = set()
+                    with open(cand, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.strip().split(',')
+                            if len(parts) >= 2:
+                                try:
+                                    base.add((int(parts[0]), int(parts[1])))
+                                except Exception:
+                                    pass
+                    cur = set((int(x), int(y)) for x, y, _ in hot_pix_coords)
+                    added_set = cur - base
+                    removed_set = base - cur
+                    added = list(added_set)
+                    removed = list(removed_set)
+                    baseline_delta = len(added) - len(removed)
+            except Exception:
+                pass
+
+            # Color metrics (best-effort)
+            stage(92, "Color metrics (if applicable)")
+            color_ratio_rg = float('nan'); color_ratio_bg = float('nan'); wb_repeat = float('nan')
+            if color_enabled:
+                try:
+                    # burst
+                    col_stack = capture_stack(8, settle=1, delay=0.0, scene_name='Color')
+                    ratios = []
+                    for fr in col_stack:
+                        if fr.ndim == 3 and fr.shape[2] == 3:
+                            ch_means = np.mean(fr.reshape(-1, 3), axis=0)
+                            R, G, B = ch_means[2], ch_means[1], ch_means[0]  # OpenCV BGR
+                            ratios.append((float(R / (G + 1e-9)), float(B / (G + 1e-9))))
+                    if ratios:
+                        arr = np.array(ratios)
+                        color_ratio_rg = float(np.mean(arr[:, 0]))
+                        color_ratio_bg = float(np.mean(arr[:, 1]))
+                        wb_repeat = float(100.0 * np.std(arr[:, 0]))  # % variation of R/G as proxy
+                except Exception:
+                    pass
+                try:
+                    emit_scene_stats('Color', col_stack, last_first_latency_ms.get('Color'))
+                    log('INFO', f"Color Neutrality: color_gray_balance R/G={color_ratio_rg:.4g} B/G={color_ratio_bg:.4g} wb_repeatability_pct={wb_repeat:.2f}% pass={np.isfinite(color_ratio_rg) and np.isfinite(color_ratio_bg)} scene=Color")
+                except Exception:
+                    pass
+
+            # Aggregate metrics and decisions
+            warnings_list = []
+            if flat_sat_pct > max_sat_pct:
+                warnings_list.append(f"Flat scene saturation {flat_sat_pct:.1f}% exceeds max {max_sat_pct:.1f}%")
+            if dark_sat_pct > 0.5:
+                warnings_list.append(f"Dark scene not fully dark (sat {dark_sat_pct:.2f}%)")
+            if np.isfinite(r2) and r2 < 0.95:
+                warnings_list.append(f"Linearity R² below target: {r2:.3f}")
+            if flicker_decision == 'WARN':
+                warnings_list.append("Flicker peak exceeds pass tolerance")
+            if hot_count > hot_warn:
+                warnings_list.append(f"Hot pixels above warning band: {hot_count}")
+
+            # Emit additional detailed warnings with limits and hints
+            try:
+                if flat_sat_pct > max_sat_pct:
+                    log('WARNING', f"Saturation high: measured={flat_sat_pct:.2f}% limit={max_sat_pct:.2f}% hint=Reduce exposure to keep <{max_sat_pct:.0f}% saturation")
+                if dark_sat_pct > 0.5:
+                    log('WARNING', f"Dark not fully dark: measured_sat={dark_sat_pct:.2f}% limit=0.5% hint=Ensure lens cap/off illumination")
+                if np.isfinite(r2) and r2 < 0.95:
+                    log('WARNING', f"Linearity low: R2={r2:.3f} limit=0.95 hint=Stabilize illumination or use linear region")
+                if flicker_decision == 'WARN':
+                    try:
+                        max_pk = max((p[1] for p in flicker_peaks), default=0.0)
+                    except Exception:
+                        max_pk = 0.0
+                    log('WARNING', f"Flicker elevated: max_peak={max_pk:.2f}% pass_limit={flicker_pass_pct:.2f}% hint=Use DC lighting or higher exposure")
+                if hot_count > hot_warn:
+                    log('WARNING', f"Hot pixels: count={hot_count} warn_band={hot_warn} hint=Enable hot-pixel correction or reduce temperature")
+            except Exception:
+                pass
+
+            # Overall PASS/FAIL policy (keep existing thresholds; only warn on new ones unless configured)
+            overall_pass = True
+            # Hard fails based on configured or classic checks
+            if np.isfinite(r2) and r2 < 0.90:
+                overall_pass = False
+            if hot_count > hot_fail:
+                overall_pass = False
+            if flicker_decision == 'FAIL':
+                overall_pass = False
+
+            # Build report text (single file)
+            bit_depth = 8
+            try:
+                frm = capture_frame()
+                if frm is not None and frm.dtype == np.uint16:
+                    bit_depth = 16
+            except Exception:
+                pass
+
+            def fmt_tuple_list(lst, limit=20):
+                if not lst:
+                    return '[]'
+                shown = lst[:limit]
+                extra = '' if len(lst) <= limit else f" (+{len(lst)-limit} more…)"
+                parts = []
+                for t in shown:
+                    try:
+                        if isinstance(t, tuple) and len(t) == 2:
+                            parts.append(f"({t[0]},{t[1]})")
+                        elif isinstance(t, (list, tuple)) and len(t) >= 3:
+                            parts.append(f"({t[0]},{t[1]},{int(t[2])})")
+                        else:
+                            parts.append(str(t))
+                    except Exception:
+                        parts.append(str(t))
+                return '[' + ', '.join(parts) + ']' + extra
+
+            lines = []
+            lines.append("=== IMAGE QUALITY TEST RESULT =========================================")
+            lines.append(f"Run ID: {run_id}     Camera: {model} / {serial}    SDK: {sdk_ver}")
+            lines.append(f"Operator Notes: <lens/aperture/illum/CCT>  Warm-up: {warmup_minutes}")
+            lines.append(f"Status: {status}")
+            lines.append(f"Sensor Temp: N/A      PixelFormat: {gh.get_node_value('PixelFormat') if gh and gh.has_node('PixelFormat') else 'N/A'}       BitDepth: {bit_depth}")
+            lines.append("")
+            lines.append("[CONFIG]")
+            lines.append(f"dark.N_frames={N_dark}")
+            lines.append(f"flat.N_frames={N_flat}")
+            lines.append(f"sweep.steps={sweep_steps}  sweep.frames_per_step={sweep_k}")
+            lines.append(f"target_mean_pct={target_mean_pct}")
+            lines.append(f"max_saturation_pct={max_sat_pct}")
+            lines.append(f"gamma_required={'true' if gamma_required else 'false'}")
+            lines.append(f"save_raw_images_prompted={'true' if save_images_prompt else 'false'}")
+            # images_saved_to placeholder, filled later
+            lines.append(f"images_saved_to=not saved")
+            # Prompt states
+            try:
+                lines.append(f"dark_scene_prompt={dark_prompt_state}")
+            except Exception:
+                lines.append(f"dark_scene_prompt=confirmed")
+            try:
+                lines.append(f"light_scene_prompt={light_prompt_state}")
+            except Exception:
+                lines.append(f"light_scene_prompt=confirmed")
+            if ('light_prompt_state' in locals() and light_prompt_state == 'canceled') or ('dark_prompt_state' in locals() and dark_prompt_state == 'canceled'):
+                lines.append("scene_skipped_reason=user_canceled_prompt")
+            lines.append("")
+            lines.append("[SCENES & SETTINGS SNAPSHOTS]")
+            def get_node(n):
+                try:
+                    return gh.get_node_value(n) if gh.has_node(n) else 'N/A'
+                except Exception:
+                    return 'N/A'
+            lines.append(f"Dark: Exposure={get_node('ExposureTime') or get_node('ExposureTimeAbs')}, Gain={get_node('Gain')}, Gamma={get_node('Gamma')}, BlackLevel={get_node('BlackLevel')}, ROI={get_node('Width')}x{get_node('Height')}, FPS={get_node('AcquisitionFrameRate')}, Frames={N_dark}")
+            lines.append(f"Flat: Exposure={get_node('ExposureTime') or get_node('ExposureTimeAbs')}, Gain={get_node('Gain')}, ...")
+            lines.append(f"Sweep: Gains={get_node('Gain')}, Exposure steps={[round(e,2) for e in used_exps]}")
+            lines.append(f"Edge(Optional): Exposure={get_node('ExposureTime') or get_node('ExposureTimeAbs')}, ...")
+            lines.append(f"StrayLight: Exposure={get_node('ExposureTime') or get_node('ExposureTimeAbs')}, Gain={get_node('Gain')}, LeakCondition=<operator note>")
+            if color_enabled:
+                lines.append(f"Color(Optional): Exposure={get_node('ExposureTime') or get_node('ExposureTimeAbs')}, WB mode={get_node('BalanceWhiteAuto')}, Gains RGB=...")
+            lines.append("")
+            lines.append("[METRICS]")
+            lines.append(f"TemporalNoise(EMVA): value={temporal_noise_dn:.4g}, units=DN, pass={np.isfinite(temporal_noise_dn)}, method=median per-pixel std over N_dark, scene=Dark")
+            lines.append(f"DSNU(EMVA): value={dsnu_dn:.4g}, units=DN, pass={np.isfinite(dsnu_dn)}, method=std of dark mean frame, scene=Dark")
+            lines.append(f"PRNU(EMVA): value={prnu:.4g}, units=ratio, pass={np.isfinite(prnu)}, method=std/mean of (Flat-Dark), scene=Flat")
+            lines.append(f"Linearity: gain={slope:.4g}, offset={intercept:.4g}, R2={r2:.4g}, method=OLS on mean DN vs exposure, scene=Sweep")
+            lines.append(f"DynamicRange: dr_db={dr_db:.4g}, dr_stops={dr_stops:.4g}, method=20log10(Sat/NoiseFloor), scenes=Dark+Sweep")
+            lines.append(f"NoiseFloor(EMVA): value={noise_floor:.4g}, units=DN, method=median per-pixel std on Dark, scene=Dark")
+            lines.append(f"MeanSignal: flat_mean_DN={mean_signal:.4g}, sat_pct={flat_sat_pct:.2f}")
+            lines.append(f"MTF / MTF Proxy: mtf_proxy={mtf_proxy:.4g}")
+            lines.append(f"FFT_Rolloff: slope={fft_rolloff:.4g}")
+            lines.append(f"Flicker: peaks={[(round(a,2), round(b,2)) for a,b in flicker_peaks]}, decision={flicker_decision}")
+            lines.append(f"HotPixels: count={hot_count}, top20={fmt_tuple_list(hot_pix_coords, 20)}, baseline_delta={baseline_delta}")
+            lines.append(f"StrayLight: delta_DN={stray_delta:.4g}, increase_pct={stray_increase_pct:.2f}, note=DN-based")
+            if color_enabled:
+                lines.append(f"Color(CCM Neutrality): ratio_R/G={color_ratio_rg:.4g}, ratio_B/G={color_ratio_bg:.4g}, WB_repeatability={wb_repeat:.2f}%")
+            lines.append("")
+            lines.append("[WARNINGS & NOTES]")
+            if warnings_list:
+                for wmsg in warnings_list:
+                    lines.append(f"- {wmsg}")
+            else:
+                lines.append("- None")
+            lines.append("")
+            lines.append("[PASS/FAIL SUMMARY]")
+            lines.append(f"Overall: {'PASS' if overall_pass else 'FAIL'}")
+            if not overall_pass:
+                reasons = []
+                if np.isfinite(r2) and r2 < 0.90:
+                    reasons.append("Linearity R² below threshold")
+                if hot_count > hot_fail:
+                    reasons.append("Hot pixels exceed fail band")
+                if flicker_decision == 'FAIL':
+                    reasons.append("Flicker above fail band")
+                lines.append(f"Reasons (for FAIL): {', '.join(reasons) if reasons else 'N/A'}")
+            lines.append("")
+            lines.append("[IMAGE REFERENCES]")
+            lines.append("User declined image saving.")
+
+            report_text = "\n".join(lines)
+
+            # Final summary block in logs before finalization
+            try:
+                log('INFO', "---- Summary (key metrics) ----")
+                log('INFO', f"temporal_noise_dn={temporal_noise_dn:.4g} scene=Dark pass={np.isfinite(temporal_noise_dn)}")
+                log('INFO', f"dsnu_dn={dsnu_dn:.4g} scene=Dark pass={np.isfinite(dsnu_dn)}")
+                log('INFO', f"prnu_pct={(prnu*100.0 if np.isfinite(prnu) else float('nan')):.4g}% scene=Flat pass={np.isfinite(prnu)}")
+                log('INFO', f"linearity_r2={r2:.4g} scene=Sweep pass={(np.isfinite(r2) and r2>=0.95)}")
+                log('INFO', f"dr_db={dr_db:.4g}dB dr_stops={dr_stops:.4g} scene=Sweep pass={np.isfinite(dr_db)}")
+                log('INFO', f"noise_floor_dn={noise_floor:.4g} scene=Dark pass={np.isfinite(noise_floor)}")
+                log('INFO', f"mtf_proxy={mtf_proxy:.4g} scene=Edge pass={np.isfinite(mtf_proxy)}")
+                log('INFO', f"fft_rolloff_slope={fft_rolloff:.4g} scene=Edge pass={np.isfinite(fft_rolloff)}")
+                log('INFO', f"flicker_decision={flicker_decision} scene=Flicker")
+                log('INFO', f"hot_pixels_count={hot_count} scene=Dark pass={hot_count <= hot_fail}")
+            except Exception:
+                pass
+
+            # Post-test prompt to save images/plots and finalize report on GUI thread
+            def _finalize_on_gui():
+                nonlocal report_text
+                images_saved_to = 'not saved'
+                figures = {}
+                # Create figures now in GUI thread to avoid thread-unsafe backends
+                try:
+                    import matplotlib as _mpl
+                    try:
+                        _mpl.use('Agg')
+                    except Exception:
+                        pass
+                    import matplotlib.pyplot as plt
+                    # hist_dark
+                    fig1 = plt.figure(figsize=(5,3)); plt.hist(dark_mean.ravel(), bins=64, color='gray'); plt.title('Dark Histogram'); plt.xlabel('DN'); plt.ylabel('Count'); figures['hist_dark.png'] = fig1
+                    # hist_flat
+                    fig2 = plt.figure(figsize=(5,3)); plt.hist(flat_mean.ravel(), bins=64, color='orange'); plt.title('Flat Histogram'); plt.xlabel('DN'); plt.ylabel('Count'); figures['hist_flat.png'] = fig2
+                    # prnu/dsnu heatmaps
+                    fig3 = plt.figure(figsize=(4,4)); plt.imshow(dark_mean, cmap='magma'); plt.title('DSNU map'); plt.colorbar(); figures['dsnu_heatmap.png'] = fig3
+                    fig4 = plt.figure(figsize=(4,4)); plt.imshow(signal, cmap='viridis'); plt.title('PRNU map (signal)'); plt.colorbar(); figures['prnu_heatmap.png'] = fig4
+                    # linearity
+                    if len(used_exps) >= 2:
+                        fig5 = plt.figure(figsize=(4,3)); plt.plot(used_exps, sweep_means, 'o');
+                        try:
+                            xx = np.linspace(min(used_exps), max(used_exps), 100); yy = slope*xx + intercept; plt.plot(xx, yy, '-');
+                        except Exception:
+                            pass
+                        plt.xscale('log'); plt.xlabel('Exposure'); plt.ylabel('Mean DN'); plt.title('Linearity'); figures['linearity.png'] = fig5
+                    # ptc
+                    if len(sweep_means) >= 2:
+                        fig6 = plt.figure(figsize=(4,3)); plt.plot(sweep_means, sweep_vars, 'o'); plt.xlabel('Mean DN'); plt.ylabel('Variance'); plt.title('PTC'); figures['ptc.png'] = fig6
+                    # dr gauge (simple text figure)
+                    fig7 = plt.figure(figsize=(4,2)); plt.title('Dynamic Range'); plt.text(0.1,0.5,f"DR: {dr_db:.1f} dB ({dr_stops:.2f} stops)"); plt.axis('off'); figures['dr_gauge.png'] = fig7
+                    # mtf or fft rolloff
+                    fig8 = plt.figure(figsize=(4,3)); plt.title('FFT Rolloff'); plt.bar([0], [fft_rolloff]); plt.xticks([0],["rolloff"]); figures['fft_rolloff.png'] = fig8
+                    # hot pixel map
+                    if hot_pix_coords:
+                        fig9 = plt.figure(figsize=(4,4)); ys=[p[1] for p in hot_pix_coords]; xs=[p[0] for p in hot_pix_coords]; plt.scatter(xs, ys, s=2, c='r'); plt.gca().invert_yaxis(); plt.title('Hot Pixel Map'); figures['hot_pixel_map.png'] = fig9
+                    # straylight hist
+                    fig10 = plt.figure(figsize=(4,3)); plt.hist(stray_gray.ravel(), bins=64, color='purple'); plt.title('Stray-light Histogram'); figures['straylight_hist.png'] = fig10
+                    # color balance
+                    if color_enabled and np.isfinite(color_ratio_rg) and np.isfinite(color_ratio_bg):
+                        fig11 = plt.figure(figsize=(4,3)); plt.bar(['R/G','B/G'], [color_ratio_rg, color_ratio_bg]); plt.ylim(0,2); plt.title('Gray Balance'); figures['color_gray_balance.png'] = fig11
+                except Exception:
+                    figures = {}
+
+                if save_images_prompt and figures:
+                    from PyQt5.QtWidgets import QMessageBox, QFileDialog, QWidget
+                    # Prefer the main GUI window as parent for modality
+                    try:
+                        parent_widget = self.view if isinstance(self.view, QWidget) else None
+                    except Exception:
+                        parent_widget = None
+                    try:
+                        resp = QMessageBox.question(
+                            parent_widget,
+                            'Save Images',
+                            'Do you want to save all images and plots from this test?',
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.Yes
+                        )
+                    except Exception:
+                        resp = QMessageBox.No
+                    if resp == QMessageBox.Yes:
+                        try:
+                            # Reuse the standard folder picker component
+                            folder = QFileDialog.getExistingDirectory(parent_widget, 'Select Directory to Save Images', '')
+                        except Exception:
+                            folder = ''
+                        if folder:
+                            # compute relative path to report directory
+                            try:
+                                images_saved_to = os.path.relpath(folder, os.path.dirname(report_path))
+                            except Exception:
+                                images_saved_to = folder
+                            # Save all figures
+                            for name, fig in figures.items():
+                                try:
+                                    fig.savefig(os.path.join(folder, name), dpi=120, bbox_inches='tight')
+                                except Exception:
+                                    pass
+                            # Close figures to free resources
+                            try:
+                                import matplotlib.pyplot as plt
+                                plt.close('all')
+                            except Exception:
+                                pass
+                # Update report text with images_saved_to and image references
+                rep_lines = report_text.splitlines()
+                for i, ln in enumerate(rep_lines):
+                    if ln.startswith('images_saved_to='):
+                        rep_lines[i] = f"images_saved_to={'not saved' if images_saved_to=='not saved' else images_saved_to}"
+                        break
+                # Replace [IMAGE REFERENCES] section content
+                try:
+                    idx = rep_lines.index('[IMAGE REFERENCES]')
+                    rep_lines = rep_lines[:idx+1]
+                    if images_saved_to == 'not saved' or not figures:
+                        rep_lines.append('User declined image saving.')
+                    else:
+                        # list filenames only
+                        for fn in figures.keys():
+                            rep_lines.append(f"- {fn}")
+                except Exception:
+                    pass
+                report_text_final = "\n".join(rep_lines)
+
+                # Write single report file
+                try:
+                    with open(report_path, 'w', encoding='utf-8') as f:
+                        f.write(report_text_final)
+                    log('SUCCESS', f"Wrote test_result.txt → {report_path}")
+                except Exception as e:
+                    log('ERROR', f"Failed to write report: {e}")
+
+                # Show results dialog
+                try:
+                    self.view.update_test_results('Image Quality', report_text_final)
+                except Exception:
+                    pass
+
+            # Invoke GUI-thread finalization
+            try:
+                # Slight delay so the progress dialog can close before showing prompts
+                QTimer.singleShot(200, _finalize_on_gui)
+            except Exception:
+                # Fallback: write report without images
+                try:
+                    with open(report_path, 'w', encoding='utf-8') as f:
+                        f.write(report_text)
+                except Exception:
+                    pass
+                self.view.update_test_results('Image Quality', report_text)
+
             return True
 
         except Exception as e:
-            error_msg = f"Failed to run image quality tests: {str(e)}"
-            self.logger.error(error_msg)
-            self.view.show_error("Test Error", error_msg)
+            err = f"Failed to run image quality tests: {e}"
+            self.logger.error(err)
+            try:
+                self.view.show_error('Test Error', err)
+            except Exception:
+                pass
             return False
+
+    def run_image_quality_tests_async(self, on_done):
+        """Asynchronous wrapper to run ImageQuality in a background thread and report completion on the UI thread.
+
+        on_done: callable(bool) invoked on UI thread with True/False when finished.
+        """
+        import threading
+
+        def _runner():
+            ok = False
+            try:
+                ok = bool(self.run_image_quality_tests())
+            except Exception:
+                ok = False
+            # Report back on UI thread if possible
+            try:
+                QTimer.singleShot(0, lambda: on_done(ok))
+            except Exception:
+                try:
+                    on_done(ok)
+                except Exception:
+                    pass
+
+        try:
+            t = threading.Thread(target=_runner, name="ImageQualityAsync", daemon=True)
+            t.start()
+        except Exception as e:
+            try:
+                QTimer.singleShot(0, lambda: on_done(False))
+            except Exception:
+                try:
+                    on_done(False)
+                except Exception:
+                    pass
 
     def run_max_fps_test(self):
         """Run max FPS test"""
