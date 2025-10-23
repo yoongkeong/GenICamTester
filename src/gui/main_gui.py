@@ -16,6 +16,30 @@ import numpy as np
 from .presenter import CameraPresenter
 import os
 
+# Add matplotlib canvas for lightweight plotting (histogram + dynamic plot)
+# Guard against NumPy/Matplotlib ABI mismatch by catching import errors broadly.
+try:
+    import numpy as _np
+    _np_ver = tuple(int(p.split('.')[0]) for p in _np.__version__.split('.')[:1])
+    # Do not attempt to import matplotlib if NumPy >= 2 and an incompatible wheel is present
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    FigureCanvas = None
+    Figure = None
+    MATPLOTLIB_AVAILABLE = False
+
+# Prefer pyqtgraph for real-time plotting if available (lighter-weight)
+try:
+    import pyqtgraph as pg
+    PYQTGRAPH_AVAILABLE = True
+except Exception:
+    pg = None
+    PYQTGRAPH_AVAILABLE = False
+
+from collections import deque
+
 class CameraSelectionDialog(QDialog):
     def __init__(self, parent=None, cameras=None):
         super().__init__(parent)
@@ -92,6 +116,8 @@ class ViewInvoker(QObject):
     sig_log_message = pyqtSignal(str, str)
     sig_update_test_results = pyqtSignal(str, str)
     sig_show_error = pyqtSignal(str, str)
+    sig_update_progress = pyqtSignal(int, str)
+    sig_set_controls = pyqtSignal(bool)
 
     def __init__(self, parent_gui: 'CameraTestGUI'):
         super().__init__(parent_gui)
@@ -100,6 +126,15 @@ class ViewInvoker(QObject):
         self.sig_log_message.connect(self._gui.log_message)
         self.sig_update_test_results.connect(self._gui.update_test_results)
         self.sig_show_error.connect(self._gui.show_error)
+        # Progress updates from background tests
+        try:
+            self.sig_update_progress.connect(self._gui._on_test_progress)
+        except Exception:
+            pass
+        try:
+            self.sig_set_controls.connect(self._gui._on_set_controls)
+        except Exception:
+            pass
 
 class ThreadSafeViewProxy:
     """Proxy object passed as presenter.view while tests run in a worker thread.
@@ -123,6 +158,20 @@ class ThreadSafeViewProxy:
 
     def update_test_results(self, title: str, results: str):
         self._inv.sig_update_test_results.emit(title, results)
+
+    def update_test_progress(self, pct: int, text: str):
+        """Emit progress updates to the GUI thread."""
+        try:
+            self._inv.sig_update_progress.emit(int(pct), str(text))
+        except Exception:
+            pass
+
+    def set_controls_enabled(self, enabled: bool):
+        """Request enabling/disabling of run controls on the GUI thread."""
+        try:
+            self._inv.sig_set_controls.emit(bool(enabled))
+        except Exception:
+            pass
 
     def show_error(self, title: str, message: str):
         self._inv.sig_show_error.emit(title, message)
@@ -168,6 +217,25 @@ class CameraTestGUI(QMainWindow):
         self.live_timer.setInterval(33)  # ~30 FPS
         
         self.initUI()
+    
+    def _on_test_progress(self, pct: int, text: str):
+        """Handle test progress emitted from presenter (UI thread).
+        Route to any open TestSetupDialog so the embedded progress bar updates.
+        """
+        try:
+            # Find any visible TestSetupDialog and update its embedded progress
+            from PyQt5.QtWidgets import QApplication
+            for w in QApplication.topLevelWidgets():
+                try:
+                    if w.__class__.__name__ == 'TestSetupDialog' and w.isVisible():
+                        try:
+                            w.set_embedded_progress(int(pct), str(text))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def init_styles(self):
         """Initialize application-wide styles"""
@@ -1688,35 +1756,27 @@ class LongRunTestDialog(QDialog):
         self.image_timer.start(33)  # ~30 FPS update rate
 
     def update_live_image(self):
-        """Update the live image display"""
-        if self.is_running:
-            frame = self.parent.presenter.get_current_frame()
-            if frame is not None:
-                try:
-                    # Convert frame to RGB
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    
-                    # Create QImage from frame
-                    h, w, ch = frame_rgb.shape
-                    bytes_per_line = ch * w
-                    qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                    
-                    # Scale to fit the label while maintaining aspect ratio
-                    pixmap = QPixmap.fromImage(qt_image)
-                    scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
-                    
-                    # Display the image
-                    self.image_label.setPixmap(scaled_pixmap)
-                except Exception as e:
-                    self.parent.log_message(f"Error updating live image: {str(e)}", "ERROR")
+        """Update the live view with the current frame"""
+        frame = self.presenter.get_current_frame()
+        if frame is not None:
+            try:
+                # Convert frame to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Create QImage from frame
+                h, w, ch = frame_rgb.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                
+                # Scale to fit the label while maintaining aspect ratio
+                pixmap = QPixmap.fromImage(qt_image)
+                scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio)
+                
+                # Display the image
+                self.image_label.setPixmap(scaled_pixmap)
+            except Exception as e:
+                self.log_message(f"Error updating live image: {str(e)}", "ERROR")
 
-    def closeEvent(self, event):
-        """Handle dialog closure"""
-        if self.is_running:
-            self.stop_test()
-        self.image_timer.stop()
-        event.accept()
-        
     def start_test(self):
         total_minutes = self.hours_input.value() * 60 + self.minutes_input.value()
         if total_minutes <= 0:
@@ -1974,6 +2034,8 @@ class TestSetupDialog(QDialog):
         self._runlog_truncated = False
         self._last_line_cache = None
 
+       
+
         # Start live view immediately for user adjustments
         try:
             self.parent.presenter.start_live_view()
@@ -2166,7 +2228,11 @@ class TestSetupDialog(QDialog):
         grp.setLayout(vlay)
         right.addWidget(grp)
 
-        # Run Log console below live view
+        # Run Log console and charts area below live view
+        lower_area = QHBoxLayout()
+
+        # Left column: Run Log + Progress
+        log_col = QVBoxLayout()
         log_group = QGroupBox("Run Log")
         lglay = QVBoxLayout()
 
@@ -2195,62 +2261,222 @@ class TestSetupDialog(QDialog):
         self.run_log_text.setStyleSheet("QTextEdit { font-family: 'Consolas', 'Courier New', monospace; }")
         lglay.addWidget(self.run_log_text)
 
+        # Embedded compact progress bar (hidden when idle)
+        self.embedded_progress = QProgressBar()
+        self.embedded_progress.setVisible(False)
+        self.embedded_progress.setFixedHeight(16)
+        self.embedded_progress.setTextVisible(True)
+        self.embedded_progress.setRange(0, 100)
+        self.embedded_progress.setValue(0)
+        lglay.addWidget(self.embedded_progress)
+
         log_group.setLayout(lglay)
-        right.addWidget(log_group)
+        log_col.addWidget(log_group)
+
+        # Right column: Charts stacked vertically
+        charts_col = QVBoxLayout()
+
+        # Prepare dynamic data buffer and counters
+        self._dyn_data = deque(maxlen=512)
+        self._dyn_x = deque(maxlen=512)
+        self._dyn_counter = 0
+        self._dyn_frame_update_skip = 8  # update dynamic plot ~4 Hz at 30 FPS
+        self._current_phase = ''
+
+        # Histogram and dynamic plot widgets (prefer pyqtgraph)
+        try:
+            if PYQTGRAPH_AVAILABLE and pg is not None:
+                try:
+                    self.hist_plot = pg.PlotWidget(title='Histogram')
+                    self.hist_plot.setBackground('w')
+                    self.hist_curve = self.hist_plot.plot(pen=pg.mkPen('k'))
+                    charts_col.addWidget(self.hist_plot)
+                except Exception:
+                    self.hist_plot = None
+                    self.hist_curve = None
+                try:
+                    self.dyn_plot = pg.PlotWidget(title='Dynamic Plot')
+                    self.dyn_plot.setBackground('w')
+                    self._dyn_curve = self.dyn_plot.plot(pen=pg.mkPen('b'))
+                    charts_col.addWidget(self.dyn_plot)
+                except Exception:
+                    self.dyn_plot = None
+                    self._dyn_curve = None
+            else:
+                # Fall back to matplotlib if available
+                if MATPLOTLIB_AVAILABLE and Figure is not None and FigureCanvas is not None:
+                    self.hist_fig = Figure(figsize=(4,2), tight_layout=True)
+                    self.hist_canvas = FigureCanvas(self.hist_fig)
+                    self.hist_ax = self.hist_fig.add_subplot(111)
+                    self.hist_ax.set_title('Histogram')
+                    charts_col.addWidget(self.hist_canvas)
+
+                    self.dyn_fig = Figure(figsize=(4,2), tight_layout=True)
+                    self.dyn_canvas = FigureCanvas(self.dyn_fig)
+                    self.dyn_ax = self.dyn_fig.add_subplot(111)
+                    self.dyn_ax.set_title('Dynamic Plot')
+                    charts_col.addWidget(self.dyn_canvas)
+                else:
+                    self.hist_canvas = None
+                    self.hist_ax = None
+                    self.dyn_canvas = None
+                    self.dyn_ax = None
+        except Exception:
+            self.hist_canvas = None
+            self.hist_ax = None
+            self.dyn_canvas = None
+            self.dyn_ax = None
+
+        lower_area.addLayout(log_col, 3)
+        lower_area.addLayout(charts_col, 2)
+
+        right.addLayout(lower_area)
         right.addStretch()
-        right_w = QWidget(); right_w.setLayout(right)
+        right_w = QWidget()
+        right_w.setLayout(right)
         root.addWidget(right_w, 6)
         self.setLayout(root)
+
+    def set_embedded_progress(self, pct: int, text: str):
+        """Update embedded progress bar and phase label from UI thread."""
+        try:
+            if getattr(self, 'embedded_progress', None) is None:
+                return
+            pct = max(0, min(100, int(pct)))
+            try:
+                # Show progress bar when running
+                self.embedded_progress.setVisible(True)
+                self.embedded_progress.setValue(pct)
+                # Set format like: "45 % - Flat Field Capture"
+                self.embedded_progress.setFormat(f"{pct} % - {text}")
+            except Exception:
+                pass
+            # Also reflect short status in run log first line
+            try:
+                if text:
+                    self._append_run_log(text, 'INFO')
+            except Exception:
+                pass
+            # Auto-hide when complete
+            if pct >= 100:
+                try:
+                    QTimer.singleShot(500, lambda: self.embedded_progress.setVisible(False))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _update_live_image(self):
         frame = self.parent.presenter.get_current_frame()
         if frame is None:
             return
         try:
-            frm_bgr = frame
-            frm_rgb = cv2.cvtColor(frm_bgr, cv2.COLOR_BGR2RGB)
-            h, w, ch = frm_rgb.shape
-            bytes_per_line = ch * w
-            qimg = QImage(frm_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pix = QPixmap.fromImage(qimg).scaled(self.live_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            frm = frame
+            # Handle grayscale images
+            if len(frm.shape) == 2 or (len(frm.shape) == 3 and frm.shape[2] == 1):
+                # Grayscale
+                gray = frm if len(frm.shape) == 2 else frm[:, :, 0]
+                rgb_display = cv2.cvtColor(cv2.merge([gray, gray, gray]), cv2.COLOR_BGR2RGB)
+                try:
+                    self.parent.log_message("Image is grayscale — skipping BGR color conversion.", "INFO")
+                except Exception:
+                    pass
+            else:
+                rgb_display = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
 
-            # Overlay quick stats: mean DN, %sat, GV0/GVmax counts
+            h, w = rgb_display.shape[:2]
+            bytes_per_line = 3 * w
+            qimg = QImage(rgb_display.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(self.live_label.size(), Qt.KeepAspectRatio)
+
+            # Apply zoom/pan
+            if getattr(self, '_zoom', 1.0) != 1.0:
+                pix = pix.scaled(int(pix.width() * getattr(self, '_zoom', 1.0)), int(pix.height() * getattr(self, '_zoom', 1.0)), Qt.KeepAspectRatio)
+            canvas = QPixmap(self.live_label.size())
+            canvas.fill(Qt.black)
+            painter = QPainter(canvas)
+            tx = getattr(self, '_pan_offset', QPoint(0,0)).x()
+            ty = getattr(self, '_pan_offset', QPoint(0,0)).y()
+            painter.drawPixmap(tx, ty, pix)
+            painter.end()
+            self.live_label.setPixmap(canvas)
+
+            # Update histogram and dynamic plots
             try:
-                gray = cv2.cvtColor(frm_bgr, cv2.COLOR_BGR2GRAY)
-                mean_dn = float(np.mean(gray))
-                # Infer saturation DN from dtype
-                max_dn = 255.0 if gray.dtype == np.uint8 else 65535.0
-                sat_pct = float(100.0 * (gray.max() / max_dn)) if max_dn > 0 else 0.0
-                gv0 = int((gray == 0).sum())
-                gvmax = int((gray == int(max_dn)).sum())
+                # Compute gray histogram
+                if len(frm.shape) == 2:
+                    gray_img = frm
+                else:
+                    gray_img = cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)
+                hist = cv2.calcHist([gray_img], [0], None, [256], [0,256]).flatten()
+                # Normalize for display
+                if hist.sum() > 0:
+                    hist = hist / hist.sum()
+                # Update pyqtgraph if available
+                if PYQTGRAPH_AVAILABLE and getattr(self, 'hist_plot', None) is not None and getattr(self, 'hist_curve', None) is not None:
+                    try:
+                        x = np.arange(len(hist))
+                        self.hist_curve.setData(x, hist)
+                    except Exception:
+                        pass
+                elif MATPLOTLIB_AVAILABLE and getattr(self, 'hist_ax', None) is not None:
+                    try:
+                        self.hist_ax.clear()
+                        self.hist_ax.plot(hist, color='black')
+                        self.hist_canvas.draw_idle()
+                    except Exception:
+                        pass
 
-                painter = QPainter(pix)
-                painter.setRenderHint(QPainter.Antialiasing)
-                # Draw semi-transparent box
-                from PyQt5.QtGui import QColor
-                bg = QColor(0, 0, 0, 140)
-                painter.fillRect(10, 10, 260, 70, bg)
-                # Draw text
-                painter.setPen(Qt.white)
-                painter.drawText(20, 30, f"Mean DN: {mean_dn:.1f}")
-                painter.drawText(20, 50, f"%Sat: {sat_pct:.2f}%   GV0: {gv0}   GVmax: {gvmax}")
-                painter.end()
+                # Dynamic plot: append mean intensity and update at lower rate
+                try:
+                    mean_val = float(np.mean(gray_img))
+                    self._dyn_counter += 1
+                    if self._dyn_counter % max(1, self._dyn_frame_update_skip) == 0:
+                        self._dyn_data.append(mean_val)
+                        self._dyn_x.append(len(self._dyn_x))
+                        # Update pyqtgraph
+                        if PYQTGRAPH_AVAILABLE and getattr(self, '_dyn_curve', None) is not None:
+                            try:
+                                self._dyn_curve.setData(list(self._dyn_x), list(self._dyn_data))
+                            except Exception:
+                                pass
+                        elif MATPLOTLIB_AVAILABLE and getattr(self, 'dyn_ax', None) is not None:
+                            try:
+                                self.dyn_ax.clear()
+                                self.dyn_ax.plot(list(self._dyn_x), list(self._dyn_data), color='blue')
+                                self.dyn_canvas.draw_idle()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            except Exception:
+                # Log internal histogram/dynamic plot errors to avoid breaking live update
+                try:
+                    self.parent.log_message("Error updating histogram/dynamic plots", "ERROR")
+                except Exception:
+                    pass
+
+        except Exception:
+            # Top-level live image update errors are logged but not re-raised
+            try:
+                self.parent.log_message("Error updating live image", "ERROR")
             except Exception:
                 pass
-
-            self.live_label.setPixmap(pix)
-        except Exception:
-            pass
 
     def _start_test(self):
         # Prefix logs with test name
         self.parent._set_log_prefix(self.test_name)
         self.parent.log_message("Starting test…", "INFO")
 
-        # Show standardized progress dialog (indeterminate by default)
-        self._progress = TestProgressDialog(self, test_name=self.test_name, max_steps=0, on_cancel=self._on_cancel)
-        self._progress.set_progress_range(0, 0)  # Indeterminate
-        self._progress.update_status("Running…")
+        # Use embedded progress bar inside this dialog instead of a separate progress window
+        try:
+            self.embedded_progress.setVisible(True)
+            self.embedded_progress.setRange(0, 100)
+            self.embedded_progress.setValue(0)
+            self.embedded_progress.setFormat("0 % - Starting…")
+        except Exception:
+            pass
 
         # Prepare run log console
         self.run_log_text.clear()
@@ -2309,12 +2535,13 @@ class TestSetupDialog(QDialog):
             except Exception:
                 pass
             try:
+                # Ensure presenter will call show_blocking_prompt for Dark/Light scenes which shows a modal on UI thread
                 self.parent.presenter.run_image_quality_tests_async(_done_cb)
             except Exception as e:
                 self._append_run_log(f"Failed to start ImageQuality async: {e}", "ERROR")
                 QTimer.singleShot(0, lambda: self._on_finished(False, str(e)))
-            # Keep the progress dialog modal while the async runner proceeds; it will close via _on_finished
-            self._progress.exec_()
+            # Embedded progress will be updated via presenter -> view.update_test_progress
+            # Do not open a separate modal progress dialog; allow prompts to appear on top of this setup dialog.
         else:
             # Launch worker thread to run the provided callable
             self._thread = QThread()
@@ -2327,8 +2554,6 @@ class TestSetupDialog(QDialog):
             self._thread.finished.connect(self._thread.deleteLater)
             self._thread.start()
 
-            self._progress.exec_()
-
     def _on_cancel(self):
         try:
             if hasattr(self, '_worker'):
@@ -2339,8 +2564,6 @@ class TestSetupDialog(QDialog):
                     self.parent.presenter._cancel_requested = True
             except Exception:
                 pass
-            # Best-effort: stop live grabbing if running to release camera for tests
-            # but keep right panel live for other flows as required
         except Exception:
             pass
         # Immediate cancellation line in both consoles
@@ -2349,11 +2572,18 @@ class TestSetupDialog(QDialog):
 
     def _on_finished(self, success: bool, error_message: str):
         try:
-            if hasattr(self, '_progress') and self._progress:
-                if success:
-                    self._progress.complete()
-                # Close the progress dialog regardless
-                self._progress.close()
+            # Hide embedded progress and mark completion in run log
+            try:
+                if getattr(self, 'embedded_progress', None) is not None:
+                    try:
+                        if success:
+                            self.embedded_progress.setValue(100)
+                            self.embedded_progress.setFormat("100 % - Completed")
+                        QTimer.singleShot(300, lambda: self.embedded_progress.setVisible(False))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2985,7 +3215,7 @@ class CameraCalibrationDialog(QDialog):
             # Create QImage
             bytes_per_line = 3 * w
             qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pix = QPixmap.fromImage(qimg)
+            pix = QPixmap.fromImage(qimg).scaled(self.live_label.size(), Qt.KeepAspectRatio)
             # Apply zoom
             if self._zoom != 1.0:
                 pix = pix.scaled(int(pix.width() * self._zoom), int(pix.height() * self._zoom), Qt.KeepAspectRatio)
@@ -3001,7 +3231,7 @@ class CameraCalibrationDialog(QDialog):
             self.live_label.setPixmap(canvas)
         except Exception:
             try:
-                self.parent().log_message('Failed to display live frame', 'WARNING')
+                self.parent().log_message('Failed to set label image', 'WARNING')
             except Exception:
                 pass
 
@@ -3230,37 +3460,3 @@ class CameraCalibrationDialog(QDialog):
 
     def show_modal(self):
         return self.exec_()
-
-    def _set_label_image(self, label, frame):
-        try:
-            if frame is None:
-                label.clear()
-                return
-            # ensure BGR
-            img = frame
-            if img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            elif img.ndim == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            # Convert to RGB for Qt
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            h, w = img_rgb.shape[:2]
-            bytes_per_line = 3 * w
-            qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pix = QPixmap.fromImage(qimg).scaled(label.size(), Qt.KeepAspectRatio)
-            label.setPixmap(pix)
-        except Exception:
-            try:
-                self.parent().log_message('Failed to set label image', 'WARNING')
-            except Exception:
-                pass
-
-    def show_camera_calibration_dialog(self, genicam_helper, camera_helper):
-        """Factory to show CameraCalibrationDialog from the presenter."""
-        try:
-            dlg = CameraCalibrationDialog(self, genicam_helper, camera_helper)
-            res = dlg.exec_()
-            return res == QDialog.Accepted
-        except Exception as e:
-            self.log_message(f"Failed to open calibration dialog: {e}", "ERROR")
-            return False
